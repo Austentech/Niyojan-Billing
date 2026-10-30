@@ -1,0 +1,142 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter);
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-gold: var(--gold);
+  --color-navy: var(--navy);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 6px);
+}
+
+/*
+ * Niyojan Corporation brand system — light corporate theme.
+ *   Primary Navy   #1B2737
+ *   Secondary Gold #A2753B
+ *   Background     #F7F8FA
+ *   Surface        #FFFFFF
+ *   Text Primary   #202936
+ *   Text Secondary #707784
+ *   Borders        #E7E9ED
+ */
+:root {
+  --radius: 0.375rem;
+
+  --background: #f7f8fa;
+  --foreground: #202936;
+
+  --card: #ffffff;
+  --card-foreground: #202936;
+
+  --popover: #ffffff;
+  --popover-foreground: #202936;
+
+  --primary: #1b2737;
+  --primary-foreground: #ffffff;
+
+  --secondary: #eef0f4;
+  --secondary-foreground: #1b2737;
+
+  --muted: #f0f2f5;
+  --muted-foreground: #707784;
+
+  --accent: #f5f1e9;
+  --accent-foreground: #1b2737;
+
+  --destructive: #b42318;
+
+  --border: #e7e9ed;
+  --input: #d4d8de;
+  --ring: #a2753b;
+
+  --chart-1: #1b2737;
+  --chart-2: #a2753b;
+  --chart-3: #707784;
+  --chart-4: #c8ab7c;
+  --chart-5: #4a5a72;
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #202936;
+  --sidebar-primary: #1b2737;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f0f2f5;
+  --sidebar-accent-foreground: #1b2737;
+  --sidebar-border: #e7e9ed;
+  --sidebar-ring: #a2753b;
+
+  --gold: #a2753b;
+  --navy: #1b2737;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply scroll-smooth;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "cv11", "ss01";
+  }
+  /* Numerical alignment for financial data */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Refined scrollbars for long in-app lists */
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #c9ced6 transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: #c9ced6;
+    border-radius: 3px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: #aeb5c0;
+  }
+}
