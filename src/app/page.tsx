@@ -1,42 +1,47 @@
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+
 import { AuthScreen } from "@/components/auth/auth-screen";
-import { AppShell } from "@/components/app/app-shell";
-import { ensureSeeded } from "@/server/seed";
-import { getSessionUser } from "@/server/auth/session";
-import { getAuthEnvironmentInfo, getDashboardStats, listFirms, toAdminUserDto } from "@/server/queries";
-
-// Session state is read per request — the application is always dynamic.
-export const dynamic = "force-dynamic";
-
-interface PageProps {
-  searchParams: Promise<Record<string, string | string[] | undefined>>;
-}
+import { LockoutScreen } from "@/components/auth/lockout-screen";
+import { getSessionContext } from "@/lib/auth/server/context";
+import { getLockoutStateForRender } from "@/lib/auth/server/lockout";
+import { isServerEnvConfigured } from "@/lib/config/env";
+import { COOKIE_NAMES } from "@/lib/constants";
+import type { SessionContext } from "@/lib/auth/types";
 
 /**
- * Single entry route: server-side session gate. Unauthenticated visitors get
- * the auth screen (sign-in / forgot / reset via ?reset=<token>); authenticated
- * administrators get the management shell.
+ * ROOT ROUTE — the administrator login interface.
+ *
+ *   * Authenticated administrators are redirected to /dashboard.
+ *   * While the GLOBAL lockout is active, the login form is unavailable and
+ *     a dedicated security-lockout screen is shown instead.
+ *   * The CSRF double-submit token is read from the cookie seeded by the
+ *     edge proxy and embedded into every form as a hidden field.
  */
-export default async function Page({ searchParams }: PageProps) {
-  await ensureSeeded();
+export const dynamic = "force-dynamic";
 
-  const params = await searchParams;
-  const resetToken = typeof params.reset === "string" && params.reset.trim() !== "" ? params.reset.trim() : undefined;
-
-  const auth = await getSessionUser();
-  const envInfo = getAuthEnvironmentInfo();
-
-  if (!auth) {
-    return <AuthScreen envInfo={envInfo} initialResetToken={resetToken} />;
+export default async function LoginPage() {
+  let session: SessionContext | null = null;
+  try {
+    session = await getSessionContext();
+  } catch {
+    // Misconfigured environment or unreachable database: treat as
+    // unauthenticated — the login actions fail closed on their own.
+    session = null;
+  }
+  if (session) {
+    redirect("/dashboard");
   }
 
-  const [firms, stats] = await Promise.all([listFirms(), getDashboardStats()]);
+  // Rendering-time lockout probe (fail-open for RENDERING only; the
+  // authoritative, fail-closed check lives inside every server action).
+  const lockout = await getLockoutStateForRender();
+  if (lockout.isLocked) {
+    return <LockoutScreen lockedUntil={lockout.lockedUntil} secondsRemaining={lockout.secondsRemaining} />;
+  }
 
-  return (
-    <AppShell
-      user={toAdminUserDto(auth.user)}
-      firms={firms}
-      stats={stats}
-      smtpConfigured={envInfo.smtpConfigured}
-    />
-  );
+  const jar = await cookies();
+  const csrfToken = jar.get(COOKIE_NAMES.csrf)?.value ?? "";
+
+  return <AuthScreen csrfToken={csrfToken} envReady={isServerEnvConfigured()} />;
 }

@@ -1,211 +1,274 @@
 "use server";
 
-/**
- * Authentication server actions. Every action:
- *  1. rate-limits by client IP,
- *  2. re-validates input with the shared Zod schema,
- *  3. enforces account lockout / generic error semantics,
- *  4. returns a typed ActionResult (never throws secrets to the client).
- */
-import { headers } from "next/headers";
-import { randomBytes, createHash } from "node:crypto";
-import { db } from "@/lib/db";
-import { loginSchema, forgotPasswordSchema, resetPasswordSchema } from "@/lib/validators";
-import { hashPassword, verifyPassword } from "@/server/auth/password";
+import { redirect } from "next/navigation";
+
+import { EnvConfigError } from "@/lib/config/env";
+import { PublicAuthError, RequestBlockedError, SystemAuthError, logAuthError } from "@/lib/auth/errors";
+import { submitCredentials, verifyOtp, resendOtp } from "@/lib/auth/service";
+import { createSession, revokeSessionByToken, signPreauthPayload } from "@/lib/auth/server/session";
 import {
-  createSession,
-  destroyCurrentSession,
-  getSessionUser,
-  purgeExpiredSessions,
-} from "@/server/auth/session";
-import { rateLimit } from "@/server/auth/rate-limit";
-import { getBaseUrl, isSmtpConfigured, sendPasswordResetEmail } from "@/server/mailer";
-import { LOCKOUT_DURATION_MIN, LOCKOUT_THRESHOLD, RESET_TOKEN_TTL_MIN } from "@/lib/constants";
-import type { ActionResult } from "@/types/app";
+  clearPreauthCookie,
+  clearSessionCookie,
+  readPreauthCookie,
+  readSessionCookie,
+  setPreauthCookie,
+  setSessionCookie,
+} from "@/lib/auth/server/cookies";
+import { assertTrustedMutation, getClientMeta } from "@/lib/auth/server/request-guard";
+import { enforceRateLimit } from "@/lib/auth/server/rate-limit";
+import type { LockoutState } from "@/lib/auth/types";
+import type { LoginActionState, OtpActionState } from "@/types/auth";
+import { RATE_LIMITS } from "@/lib/constants";
 
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
+/**
+ * Server Actions — the ONLY state-changing authentication endpoints.
+ *
+ * Every action, in order:
+ *   1. validates origin + CSRF double-submit token (assertTrustedMutation),
+ *   2. applies server-side rate limiting (PostgreSQL atomic counters),
+ *   3. delegates to the pure flow engine (src/lib/auth/service.ts),
+ *   4. maps outcomes to safe client states (never usernames, codes, ids).
+ *
+ * All errors funnel through `mapActionError`: PublicAuthError and
+ * SystemAuthError messages are safe by construction; anything unexpected is
+ * logged server-side (with sanitized detail) and replaced by a generic
+ * message before it can reach the client.
+ */
+
+function lockoutState(lockout: LockoutState) {
+  return { lockedUntil: lockout.lockedUntil, secondsRemaining: lockout.secondsRemaining };
 }
 
-async function clientKey(prefix: string): Promise<string> {
-  const h = await headers();
-  const ip = h.get("x-forwarded-for")?.split(",")[0]?.trim() || h.get("x-real-ip") || "local";
-  return `${prefix}:${ip}`;
-}
-
-function zodFieldErrors(error: { issues: { path: PropertyKey[]; message: string }[] }): Record<string, string[]> {
-  const out: Record<string, string[]> = {};
-  for (const issue of error.issues) {
-    const key = String(issue.path[0] ?? "form");
-    (out[key] ??= []).push(issue.message);
+function mapLoginError(err: unknown): LoginActionState {
+  if (err instanceof EnvConfigError) {
+    return {
+      status: "config_error",
+      message:
+        "Authentication is not configured on this server yet: required environment variables are missing or invalid. " +
+        "An operator must complete the server configuration (see .env.example) before sign-in is possible.",
+    };
   }
-  return out;
-}
-
-export async function loginAction(input: unknown): Promise<ActionResult> {
-  const limit = rateLimit(await clientKey("login"), 10, 10 * 60 * 1000);
-  if (!limit.allowed) {
-    return { ok: false, message: `Too many sign-in attempts. Please try again in ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).` };
+  if (err instanceof RequestBlockedError) {
+    return { status: "blocked", message: err.message, retryAfterSeconds: err.retryAfterSeconds };
   }
-
-  const parsed = loginSchema.safeParse(input);
-  if (!parsed.success) {
-    return { ok: false, message: "Enter a valid email address and password.", fieldErrors: zodFieldErrors(parsed.error) };
+  if (err instanceof PublicAuthError) {
+    return { status: "blocked", message: err.message, retryAfterSeconds: err.retryAfterSeconds };
   }
-  const { email, password } = parsed.data;
-  const normalizedEmail = email.toLowerCase();
-
-  const user = await db.adminUser.findUnique({ where: { email: normalizedEmail } });
-  const genericFailure: ActionResult = { ok: false, message: "Invalid email address or password." };
-
-  if (!user) {
-    // Equalise response time to avoid user-enumeration timing signals.
-    await verifyPassword(password, "scrypt$16384$8$1$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==");
-    return genericFailure;
+  if (err instanceof SystemAuthError) {
+    return { status: "unavailable", message: err.message };
   }
-  if (!user.isActive) {
-    return genericFailure;
-  }
-
-  const now = Date.now();
-  if (user.lockedUntil && user.lockedUntil.getTime() > now) {
-    const minutes = Math.ceil((user.lockedUntil.getTime() - now) / 60000);
-    return { ok: false, message: `Account is temporarily locked after repeated failed sign-ins. Try again in ${minutes} minute(s).` };
-  }
-
-  const valid = await verifyPassword(password, user.passwordHash);
-  if (!valid) {
-    const failedAttempts = user.failedAttempts + 1;
-    const shouldLock = failedAttempts >= LOCKOUT_THRESHOLD;
-    await db.adminUser.update({
-      where: { id: user.id },
-      data: {
-        failedAttempts,
-        ...(shouldLock ? { lockedUntil: new Date(now + LOCKOUT_DURATION_MIN * 60 * 1000) } : {}),
-      },
-    });
-    if (shouldLock) {
-      return { ok: false, message: `Too many failed sign-ins. The account is locked for ${LOCKOUT_DURATION_MIN} minutes.` };
-    }
-    return genericFailure;
-  }
-
-  await db.adminUser.update({
-    where: { id: user.id },
-    data: { failedAttempts: 0, lockedUntil: null, lastLoginAt: new Date() },
-  });
-  await createSession(user.id);
-  void purgeExpiredSessions().catch(() => undefined);
-
-  return { ok: true, message: `Signed in as ${user.name}.` };
-}
-
-export async function logoutAction(): Promise<ActionResult> {
-  await destroyCurrentSession();
-  return { ok: true, message: "You have been signed out." };
-}
-
-export interface ForgotPasswordResult {
-  resetUrl?: string;
-  emailDelivered: boolean;
-}
-
-export async function forgotPasswordAction(input: unknown): Promise<ActionResult<ForgotPasswordResult>> {
-  const limit = rateLimit(await clientKey("forgot"), 5, 15 * 60 * 1000);
-  if (!limit.allowed) {
-    return { ok: false, message: `Too many reset requests. Please try again in ${Math.ceil(limit.retryAfterSeconds / 60)} minute(s).` };
-  }
-
-  const parsed = forgotPasswordSchema.safeParse(input);
-  if (!parsed.success) {
-    return { ok: false, message: "Enter a valid email address.", fieldErrors: zodFieldErrors(parsed.error) };
-  }
-
-  // Always succeed with the same message — never reveal whether the account exists.
-  const genericOk: ActionResult<ForgotPasswordResult> = {
-    ok: true,
-    message: "If an administrator account exists for that email, reset instructions have been sent.",
+  logAuthError("login_action_unexpected_error", err);
+  return {
+    status: "unavailable",
+    message: "Authentication service is temporarily unavailable. Please try again shortly.",
   };
-
-  const user = await db.adminUser.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
-  if (!user || !user.isActive) return genericOk;
-
-  // Invalidate any previously issued, still-unused tokens for this account.
-  await db.passwordResetToken.deleteMany({ where: { userId: user.id, usedAt: null } });
-
-  const token = randomBytes(32).toString("base64url");
-  await db.passwordResetToken.create({
-    data: {
-      tokenHash: sha256(token),
-      userId: user.id,
-      expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MIN * 60 * 1000),
-    },
-  });
-
-  const resetUrl = `${await getBaseUrl()}/?reset=${token}`;
-
-  if (isSmtpConfigured()) {
-    const mail = await sendPasswordResetEmail(user.email, resetUrl);
-    if (mail.delivered) return genericOk;
-    console.error("[auth] password-reset email failed to send:", mail.error);
-    return {
-      ok: false,
-      message: "Reset instructions could not be sent right now (email delivery failed). Please try again shortly.",
-    };
-  }
-
-  // SMTP not configured: log the link and (optionally, dev-only) surface it.
-  console.info(`[auth] SMTP not configured — password-reset link for ${user.email} (valid ${RESET_TOKEN_TTL_MIN} min): ${resetUrl}`);
-  if (process.env.EXPOSE_RESET_LINK === "true") {
-    return {
-      ok: true,
-      message: genericOk.message,
-      data: { resetUrl, emailDelivered: false },
-    };
-  }
-  return genericOk;
 }
 
-export async function resetPasswordAction(input: unknown): Promise<ActionResult> {
-  const limit = rateLimit(await clientKey("reset"), 10, 10 * 60 * 1000);
-  if (!limit.allowed) {
-    return { ok: false, message: "Too many attempts. Please try again in a few minutes." };
+function mapOtpError(err: unknown): OtpActionState {
+  if (err instanceof EnvConfigError) {
+    return { status: "config_error", message: "Server configuration is incomplete. Please contact your operator." };
   }
-
-  const parsed = resetPasswordSchema.safeParse(input);
-  if (!parsed.success) {
-    return { ok: false, message: "Please correct the highlighted fields.", fieldErrors: zodFieldErrors(parsed.error) };
+  if (err instanceof RequestBlockedError) {
+    return { status: "blocked", message: err.message, retryAfterSeconds: err.retryAfterSeconds };
   }
-  const { token, password } = parsed.data;
-
-  const record = await db.passwordResetToken.findUnique({ where: { tokenHash: sha256(token) } });
-  if (!record || record.usedAt !== null || record.expiresAt.getTime() <= Date.now()) {
-    return { ok: false, message: "This reset link is invalid or has expired. Please request a new one." };
+  if (err instanceof PublicAuthError) {
+    // otp_cooldown -> transient block; preauth_invalid -> back to Step 1.
+    const status = err.code === "preauth_invalid" ? "preauth_expired" : "blocked";
+    return { status, message: err.message, retryAfterSeconds: err.retryAfterSeconds };
   }
-
-  const user = await db.adminUser.findUnique({ where: { id: record.userId } });
-  if (!user || !user.isActive) {
-    return { ok: false, message: "This reset link is invalid or has expired. Please request a new one." };
+  if (err instanceof SystemAuthError) {
+    return { status: "unavailable", message: err.message };
   }
-
-  await db.$transaction([
-    db.adminUser.update({
-      where: { id: user.id },
-      data: {
-        passwordHash: await hashPassword(password),
-        failedAttempts: 0,
-        lockedUntil: null,
-        mustChangePassword: false,
-      },
-    }),
-    db.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    db.adminSession.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } }),
-  ]);
-
-  return { ok: true, message: "Password updated. All active sessions were signed out — sign in with your new password." };
+  logAuthError("otp_action_unexpected_error", err);
+  return {
+    status: "unavailable",
+    message: "Authentication service is temporarily unavailable. Please try again shortly.",
+  };
 }
 
-export async function checkSessionAction(): Promise<ActionResult<{ authenticated: boolean }>> {
-  const session = await getSessionUser();
-  return { ok: true, data: { authenticated: Boolean(session) } };
+/* ============================================================================
+ * STEP 1 — credential verification (username + password -> OTP dispatched)
+ * ==========================================================================*/
+
+export async function loginAction(_prev: LoginActionState, formData: FormData): Promise<LoginActionState> {
+  try {
+    // First env-touching call (enforceRateLimit -> service client) throws
+    // EnvConfigError when configuration is incomplete -> mapped to a
+    // fail-closed config_error state below.
+    await assertTrustedMutation(formData);
+    await enforceRateLimit("auth:login-submit", RATE_LIMITS.loginSubmit.limit, RATE_LIMITS.loginSubmit.windowSeconds);
+
+    const meta = await getClientMeta();
+    const result = await submitCredentials({
+      username: String(formData.get("username") ?? ""),
+      password: String(formData.get("password") ?? ""),
+      meta,
+    });
+
+    switch (result.status) {
+      case "otp_required": {
+        // Bind Step 2 to this verified credential check: HttpOnly, HMAC-signed,
+        // short-lived. Carries only {challengeId, adminId, exp}.
+        await setPreauthCookie(
+          signPreauthPayload({ cid: result.issuedOtp.challengeId, aid: result.issuedOtp.adminId }),
+        );
+        return {
+          status: "otp_required",
+          emailMasked: result.issuedOtp.emailMasked,
+          expiresAt: result.issuedOtp.expiresAt,
+          resendCooldownSeconds: result.issuedOtp.resendCooldownSeconds,
+        };
+      }
+      case "invalid_credentials": {
+        const remaining = result.failuresUntilLockout;
+        return {
+          status: "invalid_credentials",
+          message: "Invalid credentials.",
+          failuresUntilLockout: remaining,
+        };
+      }
+      case "locked":
+        return { status: "locked", ...lockoutState(result.lockout) };
+    }
+  } catch (err) {
+    return mapLoginError(err);
+  }
+}
+
+/* ============================================================================
+ * STEP 2 — OTP verification (8-char code -> authenticated session)
+ * ==========================================================================*/
+
+export async function verifyOtpAction(_prev: OtpActionState, formData: FormData): Promise<OtpActionState> {
+  let redirectToDashboard = false;
+
+  try {
+    await assertTrustedMutation(formData);
+    await enforceRateLimit("auth:otp-verify", RATE_LIMITS.otpVerify.limit, RATE_LIMITS.otpVerify.windowSeconds);
+
+    const preauth = await readPreauthCookie();
+    if (!preauth) {
+      return {
+        status: "preauth_expired",
+        message: "Your verification session has expired. Please sign in again.",
+      };
+    }
+
+    const meta = await getClientMeta();
+    const result = await verifyOtp({
+      challengeId: preauth.cid,
+      adminId: preauth.aid,
+      code: String(formData.get("code") ?? ""),
+      meta,
+    });
+
+    switch (result.status) {
+      case "verified": {
+        // Fresh 256-bit token per login (session-fixation prevention).
+        const session = await createSession(result.admin.id, meta);
+        await setSessionCookie(session.token);
+        await clearPreauthCookie();
+        redirectToDashboard = true;
+        return { status: "idle" };
+      }
+      case "locked":
+        return { status: "locked", ...lockoutState(result.lockout) };
+      case "expired":
+        return {
+          status: "error",
+          kind: "expired",
+          message: "That code has expired. Request a new one and try again.",
+        };
+      case "already_used":
+        return {
+          status: "error",
+          kind: "already_used",
+          message: "That code has already been used. Request a new one to continue.",
+        };
+      case "too_many_attempts":
+        return {
+          status: "error",
+          kind: "too_many_attempts",
+          message: "Too many incorrect attempts for this code. Request a new one to continue.",
+        };
+      case "not_found":
+        return {
+          status: "preauth_expired",
+          message: "Your verification session is no longer valid. Please sign in again.",
+        };
+      case "invalid":
+      default:
+        return {
+          status: "error",
+          kind: "invalid",
+          message: "Incorrect verification code. Check the email and try again.",
+        };
+    }
+  } catch (err) {
+    return mapOtpError(err);
+  } finally {
+    if (redirectToDashboard) {
+      // Executed after the state is returned: navigation is deferred so the
+      // thrown redirect can never be swallowed by the error mapping above.
+      redirect("/dashboard");
+    }
+  }
+}
+
+/* ============================================================================
+ * OTP resend — cooldown + hourly cap enforced in the service layer
+ * ==========================================================================*/
+
+export async function resendOtpAction(_prev: OtpActionState, formData: FormData): Promise<OtpActionState> {
+  try {
+    await assertTrustedMutation(formData);
+
+    const preauth = await readPreauthCookie();
+    if (!preauth) {
+      return {
+        status: "preauth_expired",
+        message: "Your verification session has expired. Please sign in again.",
+      };
+    }
+
+    const meta = await getClientMeta();
+    const result = await resendOtp({ adminId: preauth.aid, meta });
+
+    switch (result.status) {
+      case "otp_required": {
+        await setPreauthCookie(signPreauthPayload({ cid: result.issuedOtp.challengeId, aid: preauth.aid }));
+        return {
+          status: "otp_required",
+          emailMasked: result.issuedOtp.emailMasked,
+          expiresAt: result.issuedOtp.expiresAt,
+          resendCooldownSeconds: result.issuedOtp.resendCooldownSeconds,
+          message: "A new verification code has been sent.",
+        };
+      }
+      case "locked":
+        return { status: "locked", ...lockoutState(result.lockout) };
+    }
+  } catch (err) {
+    return mapOtpError(err);
+  }
+}
+
+/* ============================================================================
+ * Logout — revoke the session server-side, then clear the cookie
+ * ==========================================================================*/
+
+export async function logoutAction(formData: FormData): Promise<void> {
+  try {
+    await assertTrustedMutation(formData);
+    const token = await readSessionCookie();
+    if (token) {
+      await revokeSessionByToken(token);
+    }
+  } catch (err) {
+    // Even a blocked guard must not strand an invalid session cookie.
+    logAuthError("logout_guard_rejected", err, { fallback: "cookie-cleared" });
+  } finally {
+    await clearSessionCookie();
+    redirect("/");
+  }
 }

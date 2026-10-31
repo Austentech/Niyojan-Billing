@@ -1,0 +1,11 @@
+{
+  "name": "niyojan-verify-harness",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local PostgreSQL + PostgREST verification stack mirroring the Supabase architecture (sandbox testing only).",
+  "type": "module",
+  "dependencies": {
+    "@embedded-postgres/linux-x64": "^18.6.0-beta.19",
+    "pg": "^8.23.1"
+  }
+}

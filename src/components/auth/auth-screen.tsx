@@ -1,43 +1,69 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Building2, KeyRound, ShieldCheck } from "lucide-react";
 
 import { LogoLockup } from "@/components/brand/brand-logo";
 import { LoginForm } from "@/components/auth/login-form";
-import { ForgotPasswordForm } from "@/components/auth/forgot-password-form";
-import { ResetPasswordForm } from "@/components/auth/reset-password-form";
+import { OtpForm } from "@/components/auth/otp-form";
+import { LockoutScreen } from "@/components/auth/lockout-screen";
 import { BRAND } from "@/lib/constants";
-import type { AuthEnvironmentInfo } from "@/types/app";
-
-type AuthMode = "login" | "forgot" | "reset";
+import type { OtpScreenData } from "@/types/auth";
 
 const PANEL_POINTS = [
   {
     icon: ShieldCheck,
-    title: "Secure administrator access",
-    text: "Hardened sessions, lockout protection and audited password policies.",
-  },
-  {
-    icon: Building2,
-    title: "Centralized firm oversight",
-    text: "Every registered business, one corporate structure, one source of truth.",
+    title: "Two-step verification",
+    text: "Every sign-in is confirmed with a single-use code emailed to the administrator.",
   },
   {
     icon: KeyRound,
+    title: "Global lockout protection",
+    text: "Repeated failed attempts lock authentication worldwide for 24 hours.",
+  },
+  {
+    icon: Building2,
     title: "Trusted control",
-    text: "Financial operations stay governed, phased and reviewable.",
+    text: "Centralized oversight of every registered firm — governed, phased and audited.",
   },
 ] as const;
 
 /**
- * Authentication surface: sign-in, forgot-password and reset-password flows
- * presented in a premium corporate split layout.
+ * Authentication surface: Step 1 (credentials) -> Step 2 (email verification
+ * code), presented in a premium corporate split layout. The GLOBAL lockout
+ * screen replaces both steps whenever the server reports an active lockout.
  */
-export function AuthScreen({ envInfo, initialResetToken }: { envInfo: AuthEnvironmentInfo; initialResetToken?: string }) {
-  const [mode, setMode] = useState<AuthMode>(initialResetToken ? "reset" : "login");
-  const [resetToken, setResetToken] = useState<string | undefined>(initialResetToken);
+export function AuthScreen({
+  csrfToken,
+  envReady,
+}: {
+  csrfToken: string;
+  envReady: boolean;
+}) {
+  const [otpData, setOtpData] = useState<OtpScreenData | null>(null);
+  const [lockout, setLockout] = useState<{ lockedUntil: string | null; secondsRemaining: number } | null>(null);
+
+  const handleOtpRequired = useCallback((data: OtpScreenData) => {
+    setOtpData(data);
+  }, []);
+
+  const handleLocked = useCallback((lockedUntil: string | null, secondsRemaining: number) => {
+    setLockout({ lockedUntil, secondsRemaining });
+  }, []);
+
+  const handleRestart = useCallback(() => {
+    setOtpData(null);
+  }, []);
+
+  if (lockout) {
+    return (
+      <LockoutScreen
+        lockedUntil={lockout.lockedUntil}
+        secondsRemaining={lockout.secondsRemaining}
+      />
+    );
+  }
 
   return (
     <div className="grid min-h-screen bg-background lg:grid-cols-[44%_56%]">
@@ -104,58 +130,35 @@ export function AuthScreen({ envInfo, initialResetToken }: { envInfo: AuthEnviro
               <LogoLockup className="max-w-[240px]" priority />
             </div>
 
-            {!envInfo.smtpConfigured ? (
-              <p className="mb-6 rounded-md border border-gold/40 bg-accent px-3 py-2 text-center text-[11px] leading-relaxed text-muted-foreground">
-                Email delivery (SMTP) is not configured on this environment. Password-reset links are written to
-                the server log{envInfo.exposeResetLink ? " and shown on request" : ""}.
-              </p>
-            ) : null}
-
             <AnimatePresence mode="wait" initial={false}>
               <motion.div
-                key={mode + (resetToken ?? "")}
+                key={otpData ? "otp" : "credentials"}
                 initial={{ opacity: 0, y: 6 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -6 }}
                 transition={{ duration: 0.18, ease: "easeOut" }}
               >
-                {mode === "login" ? (
-                  <div className="space-y-6">
-                    <div className="text-center">
-                      <h1 className="text-xl font-semibold tracking-tight">Administrator sign in</h1>
-                      <p className="mt-1 text-sm text-muted-foreground">
-                        {BRAND.systemName}
-                      </p>
-                    </div>
-                    <LoginForm />
-                    <div className="text-center">
-                      <button
-                        type="button"
-                        onClick={() => setMode("forgot")}
-                        className="cursor-pointer text-sm font-medium text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline"
-                      >
-                        Forgot your password?
-                      </button>
-                    </div>
-                  </div>
-                ) : mode === "forgot" ? (
-                  <ForgotPasswordForm
-                    onBack={() => setMode("login")}
-                    onContinueToReset={(token) => {
-                      setResetToken(token);
-                      setMode("reset");
-                    }}
+                {otpData ? (
+                  <OtpForm
+                    csrfToken={csrfToken}
+                    data={otpData}
+                    onDataRefresh={setOtpData}
+                    onLocked={handleLocked}
+                    onRestart={handleRestart}
                   />
-                ) : resetToken ? (
-                  <ResetPasswordForm token={resetToken} onDone={() => setMode("login")} />
                 ) : (
-                  <ForgotPasswordForm onBack={() => setMode("login")} onContinueToReset={() => undefined} />
+                  <LoginForm
+                    csrfToken={csrfToken}
+                    envReady={envReady}
+                    onOtpRequired={handleOtpRequired}
+                    onLocked={handleLocked}
+                  />
                 )}
               </motion.div>
             </AnimatePresence>
 
             <p className="mt-10 text-center text-[11px] leading-relaxed text-muted-foreground">
-              Protected system. Activity is attributable to your administrator account.
+              Protected system · {BRAND.tagline}
             </p>
           </div>
         </div>

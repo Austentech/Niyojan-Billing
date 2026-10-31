@@ -52,3 +52,15 @@ prompt
 server.log
 # Skills directory
 /skills/
+# niyojan phase 1 — auth artifacts
+.env
+.env.local
+.dev-outbox/
+.buildcheck/
+verify-harness/pgdata/
+verify-harness/logs/
+verify-harness/logs-start.out
+verify-harness/harness-state.json
+verify-harness/postgrest.tar.xz
+verify-harness/bin/
+verify-harness/node_modules/
