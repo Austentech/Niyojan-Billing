@@ -1,10 +1,16 @@
-# Security Documentation — Phase 1 Authentication
+# Security Documentation — Phase 1 Authentication & Phase 2 Firm Management
 
-This document explains every security control in the authentication system, the
-reasoning behind the global lockout design, and the operational procedures an
-administrator of this system needs.
+This document explains every security control in the authentication system and
+the firm-management surface, the reasoning behind the global lockout design,
+and the operational procedures an administrator of this system needs.
 
 ---
+
+## Contents
+
+- §1–§8 — Phase 1 authentication (unchanged, fully in force)
+- §9 — Phase 2: firm management & file-upload security
+- §10 — Phase 2: storage adapters and what production must use
 
 ## 1. Authentication architecture
 
@@ -204,3 +210,97 @@ development (hydration works under the nonce policy; zero CSP violations).
 - `/api` reports liveness + database reachability (no data).
 - Housekeeping: `select auth_cleanup_auth_data(168, 720, 48);` purges old
   sessions/attempts/challenges — safe to schedule with pg_cron.
+
+---
+
+## 9. Phase 2 — Firm management & file-upload security
+
+### Authorization model
+
+- **Every** firm-management route (`/dashboard`, `/settings/*`) is protected by
+  server-side session validation on every request: the edge proxy fast-path
+  redirects cookie-less requests, the settings layout re-validates, and each
+  page re-validates independently (defense in depth — a forged cookie dies in
+  the database lookup).
+- The **only** state-changing firm endpoint is the `createFirmAction` Server
+  Action. It refuses to run without a valid session, a matching CSRF
+  double-submit token, a same-origin request, and rate-limit budget
+  (`firms:create`, 12/hour, PostgreSQL atomic counter shared across
+  instances).
+- Firm data is read and written **exclusively** through the service role from
+  server code. `firms` has RLS enabled with **zero policies**: anonymous and
+  authenticated Supabase keys can neither read nor write it (asserted by the
+  test suite). The browser never talks to Supabase (`connect-src 'self'`).
+- All queries go through the Supabase query builder (PostgREST parameter
+  binding) — no string-concatenated SQL anywhere. Database CHECK constraints
+  (name/address lengths, holding 0–100, URL scheme) mirror the Zod validation
+  as the last line of defense.
+
+### Input validation
+
+- One Zod schema (`src/lib/firms/validation.ts`) is shared by the client form
+  (UX only) and the server action (authoritative): required name 2–120 chars,
+  required address 5–200 chars, optional description ≤ 1000 chars, optional
+  website that must be a genuine `http(s)://` URL (`javascript:`, `ftp://`,
+  scheme-less strings rejected), and a required holding percentage matching
+  `^\d{1,3}(\.\d{1,2})?$` bounded to 0–100 (max two decimals).
+- Every field is re-validated server-side even when the client is bypassed
+  (curl / forged requests) — the tests submit invalid payloads directly
+  against the service layer.
+
+### Upload hardening (firm logos)
+
+The client's filename and Content-Type are **never trusted**. In
+  `src/lib/firms/storage.ts`, before a single byte is persisted:
+
+1. **Size limit** checked on the actual buffer (2 MB).
+2. **Magic-byte sniffing** determines the real type — a text file named
+   `.png` is rejected. Only PNG / JPEG / WebP signatures pass.
+3. **Full re-encode with sharp** proves the payload decodes as a real image,
+   strips EXIF and all metadata, caps the logo to a 512×512 box (no
+   upscaling) and discards any trailing bytes after the image payload —
+   neutralizing polyglot files (e.g. image/HTML or image/SVG-XSS combos,
+   which are rejected outright since SVG is not an accepted type).
+4. The stored filename is a **server-generated UUID + whitelisted
+   extension** — no user-controlled characters ever reach a path or object
+   key.
+
+Serving: production serves logos from the public `firm-logos` Supabase
+Storage bucket (public read is appropriate for brand assets; writes are
+service-role only). The CSP allows images from exactly `'self'`, `data:`,
+`blob:` and the project's own Supabase origin — no arbitrary hosts. In the
+development adapter, logos are served through a route handler that accepts
+**only** `/uploads/firm-logos/<uuid>.<png|jpg|webp>` (path traversal and
+non-UUID names refused, content type from the whitelist, `nosniff` always on).
+
+### XSS
+
+All firm data (names, addresses, descriptions, URLs) renders through React's
+escaping — no `dangerouslySetInnerHTML` exists in the codebase. The test
+suite stores a `<script>`-styled firm name and asserts the rendered page
+contains it only as escaped text. Website links are additionally constrained
+to `http(s)://` at validation time and rendered with
+`target="_blank" rel="noopener noreferrer"`.
+
+### CSRF on write operations
+
+`createFirmAction` and `changePasswordAction` run the same guard chain as the
+authentication actions: Server-Action origin enforcement, explicit
+Origin/Host validation against `APP_URL`, the HttpOnly double-submit CSRF
+token, and SameSite=Lax session cookies.
+
+## 10. Phase 2 — storage adapters
+
+| Mode | Use | Behaviour |
+| --- | --- | --- |
+| `supabase` (default) | Production & any real Supabase project | Uploads to the `firm-logos` bucket with the service role; public URLs from Supabase Storage. Bucket-level MIME + size limits (set in migration 0002) act as a second enforcement layer. |
+| `local` | Bundled verification harness / offline staging only | Writes the *same hardened, re-encoded* bytes to `.data/firm-logos` and serves them via the sanitized `/uploads` route. |
+
+Both adapters run the identical validation pipeline — the only difference is
+the persistence target. The `local` adapter is a development convenience for
+the harness (which has no Storage API); setting it in production is a
+configuration error (it is documented as such in `.env.example`).
+
+Operational note: if a firm insert fails *after* a logo was stored, the logo
+file/bucket object is orphaned (harmless, logged); housekeeping can remove
+objects not referenced by `firms.logo_url`.

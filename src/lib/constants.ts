@@ -42,6 +42,10 @@ export const RATE_LIMITS = {
   loginSubmit: { limit: 10, windowSeconds: 5 * 60 },
   otpVerify: { limit: 12, windowSeconds: 5 * 60 },
   otpIssue: { limit: OTP_ISSUE_HOURLY_LIMIT, windowSeconds: 60 * 60 },
+  /** Firm creation (write operation) — per rolling hour. */
+  firmCreate: { limit: 12, windowSeconds: 60 * 60 },
+  /** Account password changes — per rolling hour. */
+  passwordChange: { limit: 5, windowSeconds: 60 * 60 },
 } as const;
 
 /** Session policy: absolute expiry + idle timeout (seconds). */
@@ -60,5 +64,47 @@ export const COOKIE_NAMES = {
   csrf: "niyojan_csrf",
 } as const;
 
-/** FIRM_STATUSES reserved for Phase 2 (firm management) — not used yet. */
+/** FIRM_STATUSES reserved for future firm lifecycle features — not used yet. */
 export const FIRM_STATUSES = ["ACTIVE", "INACTIVE"] as const;
+
+/* ============================================================================
+ * FIRM MANAGEMENT POLICY (Phase 2)
+ * All values are enforced SERVER-SIDE (Zod + database CHECK constraints);
+ * client copies exist only for immediate UX feedback.
+ * ==========================================================================*/
+
+/** Validation limits for firm records (mirrored by 0002_firms.sql checks). */
+export const FIRM_POLICY = {
+  nameMinLength: 2,
+  nameMaxLength: 120,
+  addressMinLength: 5,
+  addressMaxLength: 200,
+  descriptionMaxLength: 1000,
+  websiteUrlMaxLength: 2048,
+  holdingMin: 0,
+  holdingMax: 100,
+  /** Decimal places allowed for the holding percentage. */
+  holdingMaxDecimals: 2,
+} as const;
+
+/** Firm logo upload policy — enforced on the client AND re-verified from the
+ *  actual bytes on the server (magic-byte sniffing, sharp re-encode). */
+export const FIRM_LOGO_POLICY = {
+  maxBytes: 2 * 1024 * 1024,
+  mimeTypes: ["image/png", "image/jpeg", "image/webp"] as const,
+  extensions: ["png", "jpg", "jpeg", "webp"] as const,
+  /** Logos are normalized to at most this square box (no upscaling). */
+  maxDimension: 512,
+} as const;
+
+/**
+ * Local (development) firm-logo directory for FIRM_LOGO_STORAGE_MODE=local.
+ * Served ONLY through the sanitized /uploads/[...path] route handler.
+ */
+export const FIRM_LOGO_LOCAL_DIR = ".data/firm-logos";
+
+/** URL prefix under which firm logos are served in local storage mode. */
+export const FIRM_LOGO_PUBLIC_PREFIX = "/uploads/firm-logos";
+
+/** Supabase Storage bucket dedicated to firm logos (production mode). */
+export const FIRM_LOGO_BUCKET = "firm-logos";

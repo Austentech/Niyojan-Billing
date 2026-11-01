@@ -39,6 +39,14 @@ const envSchema = z.object({
   SMTP_DEV_CAPTURE: z.enum(["true", "false"]).default("false"),
   SMTP_DEV_OUTBOX: z.string().max(512).default(".dev-outbox"),
 
+  // --- Firm logo storage (Phase 2) ----------------------------------------------
+  // "supabase" (default) — dedicated Supabase Storage bucket "firm-logos".
+  // "local" — development/staging adapter that stores files on disk and serves
+  //           them through the /uploads route (used by the verification
+  //           harness, which has no Storage API). NEVER set "local" in
+  //           production.
+  FIRM_LOGO_STORAGE_MODE: z.enum(["supabase", "local"]).default("supabase"),
+
   // --- Secrets -------------------------------------------------------------------
   AUTH_SESSION_SECRET: z.string().min(32).max(512),
   OTP_SECRET: z.string().min(32).max(512),
@@ -80,11 +88,21 @@ export function parseEnv(raw: Record<string, string | undefined>): ServerEnv {
 }
 
 let cached: ServerEnv | null = null;
+let cachedInputs = "";
 
-/** Parse and cache the server environment. Throws EnvConfigError on problems. */
+/**
+ * Parse and cache the server environment. Throws EnvConfigError on problems.
+ *
+ * The cache is keyed by the inputs that actually build clients/transporters,
+ * so a `.env` rewrite (e.g. the local verification harness re-minting keys)
+ * is picked up by the NEXT call without a server restart (Next.js reloads
+ * env files in dev without resetting module caches).
+ */
 export function getServerEnv(): ServerEnv {
-  if (cached) return cached;
+  const inputs = `${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ""}|${process.env.SUPABASE_SERVICE_ROLE_KEY ?? ""}|${process.env.SMTP_HOST ?? ""}`;
+  if (cached && cachedInputs === inputs) return cached;
   cached = parseEnv(process.env);
+  cachedInputs = inputs;
   return cached;
 }
 

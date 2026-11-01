@@ -64,3 +64,7 @@ verify-harness/harness-state.json
 verify-harness/postgrest.tar.xz
 verify-harness/bin/
 verify-harness/node_modules/
+# niyojan phase 2 — firm logo artifacts (local storage adapter)
+.data/
+# The annotated environment reference is deliberately tracked.
+!.env.example

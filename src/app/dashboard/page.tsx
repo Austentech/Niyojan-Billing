@@ -1,40 +1,34 @@
+import type { Metadata } from "next";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { Building2, LogOut, ShieldCheck } from "lucide-react";
+import Link from "next/link";
 
-import { LogoMark, Wordmark } from "@/components/brand/brand-logo";
+import { Building2, Database, TriangleAlert } from "lucide-react";
+
+import { ConsoleHeader } from "@/components/dashboard/console-header";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/common/ui-blocks";
+import { FirmsGrid } from "@/components/firms/firms-grid";
 import { getSessionContext } from "@/lib/auth/server/context";
-import { logoutAction } from "@/server/actions/auth-actions";
-import { BRAND } from "@/lib/constants";
-import { COOKIE_NAMES } from "@/lib/constants";
+import { listFirms } from "@/lib/firms/service";
+import { BRAND, COOKIE_NAMES } from "@/lib/constants";
 import type { SessionContext } from "@/lib/auth/types";
+import type { FirmView } from "@/lib/firms/types";
 
 /**
- * PROTECTED ROUTE — minimal authenticated console shell (Phase 1).
+ * PROTECTED ROUTE — the main dashboard.
  *
- * Every request validates the session server-side (database lookup:
- * revocation, absolute expiry, idle timeout). Unauthenticated visitors are
- * redirected to the login page. The full dashboard/firm-management
- * experience is deliberately NOT built here — it arrives in Phase 2 after
- * this authentication phase is signed off.
+ *   * Server-side session validation on every request (database lookup:
+ *     revocation, absolute expiry, idle timeout); unauthenticated visitors
+ *     are redirected to the login page.
+ *   * The firm collection is rendered EXCLUSIVELY from the database — firm
+ *     cards are never added in frontend code.
  */
 export const dynamic = "force-dynamic";
 
-function formatUtc(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return "—";
-  return `${d.toLocaleString("en-GB", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: "UTC",
-  })} UTC`;
-}
+export const metadata: Metadata = {
+  title: "My Firms",
+};
 
 export default async function DashboardPage() {
   let session: SessionContext | null = null;
@@ -48,108 +42,66 @@ export default async function DashboardPage() {
   }
 
   const csrfToken = (await cookies()).get(COOKIE_NAMES.csrf)?.value ?? "";
-  const issuedAt = formatUtc(session.createdAt);
-  const expiresAt = formatUtc(session.expiresAt);
+
+  let firms: FirmView[] = [];
+  let loadFailed = false;
+  try {
+    firms = await listFirms();
+  } catch {
+    // Database unreachable — degrade to an explicit error state instead of
+    // crashing the console. Nothing about the failure is exposed in detail.
+    loadFailed = true;
+  }
 
   return (
     <div className="flex min-h-screen flex-col bg-background">
-      {/* Console header */}
-      <header className="sticky top-0 z-10 border-b bg-card">
-        <div className="mx-auto flex h-14 w-full max-w-5xl items-center justify-between gap-4 px-5">
-          <div className="flex items-center gap-3">
-            <LogoMark size={30} />
-            <Wordmark className="hidden sm:block" />
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="hidden text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground md:inline">
-              Administrator Console
-            </span>
-            <form action={logoutAction}>
-              <input type="hidden" name="csrf" value={csrfToken} />
-              <Button type="submit" variant="outline" size="sm" className="h-9">
-                <LogOut className="size-4" aria-hidden="true" />
-                Sign out
-              </Button>
-            </form>
-          </div>
-        </div>
-      </header>
+      <ConsoleHeader
+        displayName={session.displayName}
+        email={session.email}
+        csrfToken={csrfToken}
+        showGreeting
+      />
 
-      <main className="mx-auto w-full max-w-5xl flex-1 px-5 py-8 sm:py-10">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight sm:text-[22px]">
-              Welcome back, {session.displayName}
-            </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              {BRAND.systemName}
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
+        <PageHeader
+          title="My Firms"
+          description="Manage and monitor all your business entities from one centralized workspace."
+          actions={
+            <Button asChild variant="outline" size="sm" className="h-9">
+              <Link href="/settings/firms">
+                <Building2 className="size-4" aria-hidden="true" />
+                Manage firms
+              </Link>
+            </Button>
+          }
+        />
+
+        {loadFailed ? (
+          <div
+            role="alert"
+            className="mt-6 flex gap-2.5 rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3.5 text-sm text-destructive"
+          >
+            <Database className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            <p className="leading-relaxed">
+              The firm list could not be loaded right now. Please refresh the page in a moment — if
+              the problem persists, contact your operator.
             </p>
           </div>
-          <Badge className="w-fit gap-1.5 border-gold/40 bg-accent text-navy hover:bg-accent">
-            <ShieldCheck className="size-3.5" aria-hidden="true" />
-            Two-step verification complete
-          </Badge>
-        </div>
+        ) : (
+          <FirmsGrid firms={firms} />
+        )}
 
-        <div className="mt-6 grid gap-4 md:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Authenticated session</CardTitle>
-              <CardDescription>
-                Your session is protected with an HttpOnly cookie and validated on every request.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-2.5 text-sm">
-              <div className="flex items-center justify-between gap-4 border-t pt-2.5">
-                <span className="text-muted-foreground">Administrator</span>
-                <span className="font-medium">{session.displayName}</span>
-              </div>
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-muted-foreground">Username</span>
-                <span className="font-mono text-[13px]">{session.username}</span>
-              </div>
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-muted-foreground">Verified email</span>
-                <span className="font-medium">{session.email}</span>
-              </div>
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-muted-foreground">Session issued</span>
-                <span className="tnum text-[13px]">{issuedAt}</span>
-              </div>
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-muted-foreground">Session expires</span>
-                <span className="tnum text-[13px]">{expiresAt}</span>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Building2 className="size-4 text-gold" aria-hidden="true" />
-                Phase 2 — Firm management
-              </CardTitle>
-              <CardDescription>Reserved for the next development phase.</CardDescription>
-            </CardHeader>
-            <CardContent className="text-sm leading-relaxed text-muted-foreground">
-              <p>
-                The firm dashboard — the centralized listing of every registered business with
-                the responsive 4 / 2 / 1 column grid — is intentionally not part of this phase.
-                It will be developed on top of this authentication foundation once Phase 1 is
-                reviewed and signed off.
-              </p>
-              <p className="mt-3 rounded-md border bg-secondary/60 px-3 py-2.5 text-[12px]">
-                Billing, invoices, GST, accounting, transactions, expenses and reporting remain
-                strictly out of scope until their dedicated phases.
-              </p>
-            </CardContent>
-          </Card>
-        </div>
-
-        <p className="mt-8 text-center text-[11px] leading-relaxed text-muted-foreground">
+        <p className="mt-10 text-center text-[11px] leading-relaxed text-muted-foreground">
           {BRAND.name} · {BRAND.tagline} · Internal system
         </p>
       </main>
+
+      {/* Screen-reader summary of load failures for assistive technology */}
+      {loadFailed ? (
+        <span className="sr-only">
+          <TriangleAlert aria-hidden="true" /> Firm list unavailable.
+        </span>
+      ) : null}
     </div>
   );
 }

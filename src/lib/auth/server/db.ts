@@ -15,11 +15,15 @@ import { SystemAuthError } from "@/lib/auth/errors";
  */
 
 let serviceClient: SupabaseClient | null = null;
+let clientKey = "";
 
 export function getSupabaseServiceClient(): SupabaseClient {
-  if (serviceClient) return serviceClient;
-
   const env = getServerEnv();
+  // Rebuild when the connection inputs change (env reload after a harness
+  // key re-mint) — never serve a client built from stale credentials.
+  const key = `${env.NEXT_PUBLIC_SUPABASE_URL}|${env.SUPABASE_SERVICE_ROLE_KEY}`;
+  if (serviceClient && clientKey === key) return serviceClient;
+
   serviceClient = createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: {
       // Server-side data access only — no user/session persistence.

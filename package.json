@@ -7,9 +7,10 @@
     "build": "next build && cp -r .next/static .next/standalone/.next/ && cp -r public .next/standalone/",
     "start": "NODE_ENV=production bun .next/standalone/server.js 2>&1 | tee server.log",
     "lint": "eslint .",
-    "db:push": "node verify-harness/start.mjs 2>/dev/null || echo '[db] Local harness unavailable \u2014 apply supabase/migrations/0001_auth_core.sql to your Supabase project instead (see README.md).'",
+    "db:push": "setsid node verify-harness/start.mjs >> verify-harness/logs-start.out 2>&1 & echo '[db] local verification harness start requested (logs: verify-harness/logs-start.out). Production: apply supabase/migrations/*.sql in the Supabase SQL editor (see README.md).'",
     "test:unit": "tsx scripts/test-unit.ts",
     "test:auth": "tsx scripts/test-auth.ts",
+    "test:firms": "tsx scripts/test-firms.ts",
     "harness:start": "node verify-harness/start.mjs",
     "harness:stop": "node verify-harness/stop.mjs"
   },

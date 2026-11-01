@@ -18,7 +18,7 @@
  */
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, openSync } from "node:fs";
 import { createHmac, randomBytes } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
@@ -30,8 +30,16 @@ const run = promisify(execFile);
 const HARNESS_DIR = path.dirname(new URL(import.meta.url).pathname);
 const PG_BIN = path.join(HARNESS_DIR, "node_modules/@embedded-postgres/linux-x64/native/bin");
 const PG_DATA = path.join(HARNESS_DIR, "pgdata");
-const MIGRATION_SQL = readFileSync(path.join(HARNESS_DIR, "../supabase/migrations/0001_auth_core.sql"), "utf8");
+const MIGRATIONS_DIR = path.join(HARNESS_DIR, "../supabase/migrations");
 const APP_ENV = path.join(HARNESS_DIR, "../.env");
+
+/** Every migration in supabase/migrations, in filename order (idempotent SQL). */
+function migrationFiles() {
+  return readdirSync(MIGRATIONS_DIR)
+    .filter((f) => f.endsWith(".sql"))
+    .sort()
+    .map((f) => ({ name: f, sql: readFileSync(path.join(MIGRATIONS_DIR, f), "utf8") }));
+}
 
 const PG_PORT = 5433;
 const POSTGREST_PORT = 5434;
@@ -193,8 +201,10 @@ async function main() {
   await admin.end();
 
   const app = await superuserClient(DB_NAME);
-  console.log("[harness] applying migration supabase/migrations/0001_auth_core.sql ...");
-  await app.query(MIGRATION_SQL);
+  for (const { name, sql } of migrationFiles()) {
+    console.log(`[harness] applying migration supabase/migrations/${name} ...`);
+    await app.query(sql);
+  }
   await app.end();
 
   /* 3. JWT secrets ------------------------------------------------------------- */

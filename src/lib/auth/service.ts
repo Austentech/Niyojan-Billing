@@ -31,7 +31,8 @@ import { LOCKOUT_FAILURE_THRESHOLD, OTP_ISSUE_HOURLY_LIMIT, OTP_MAX_ATTEMPTS, OT
 
 /* --- Internal helpers -------------------------------------------------------- */
 
-async function getAdminByUsername(username: string): Promise<AdminAccountRow | null> {
+/** Fetch an administrator account by username (exact, lowercased). */
+export async function getAdminByUsername(username: string): Promise<AdminAccountRow | null> {
   const { data, error } = await getSupabaseServiceClient()
     .from("admin_accounts")
     .select("*")
@@ -43,7 +44,8 @@ async function getAdminByUsername(username: string): Promise<AdminAccountRow | n
   return data ?? null;
 }
 
-async function getAdminById(adminId: string): Promise<AdminAccountRow | null> {
+/** Fetch an administrator account by id (used by flows and account settings). */
+export async function getAdminById(adminId: string): Promise<AdminAccountRow | null> {
   const { data, error } = await getSupabaseServiceClient()
     .from("admin_accounts")
     .select("*")
