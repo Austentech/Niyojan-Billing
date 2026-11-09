@@ -1,7 +1,10 @@
 import { z } from "zod";
 
+import { PASSWORD_POLICY } from "@/lib/constants";
+
 /**
- * Server-side environment contract for Phase 1 (authentication).
+ * Server-side environment contract (Phase 1 authentication, Phase 2 firm
+ * management, Phase 3 account settings).
  *
  * Validated lazily (never at import/build time) so `next build` succeeds
  * without credentials. Validation failures list VARIABLE NAMES ONLY — values
@@ -11,49 +14,68 @@ import { z } from "zod";
  * server secrets (SUPABASE_SERVICE_ROLE_KEY, SMTP_PASSWORD, OTP_SECRET...).
  */
 
-const envSchema = z.object({
-  // --- Initial administrator (bootstrap only) --------------------------------
-  ADMIN_NAME: z.string().trim().min(1).max(120),
-  ADMIN_USERNAME: z
-    .string()
-    .trim()
-    .toLowerCase()
-    .min(3)
-    .max(64)
-    .regex(/^[a-z0-9._-]+$/, "lowercase letters, digits, dot, underscore, hyphen"),
-  ADMIN_PASSWORD: z.string().min(10).max(128),
-  ADMIN_EMAIL: z.email().max(254),
+const storageModeSchema = z.enum(["supabase", "local"]);
 
-  // --- Supabase ---------------------------------------------------------------
-  NEXT_PUBLIC_SUPABASE_URL: z.url(),
-  NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(20),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
+const envSchema = z
+  .object({
+    // --- Initial administrator (bootstrap only) --------------------------------
+    ADMIN_NAME: z.string().trim().min(1).max(120),
+    ADMIN_USERNAME: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .min(3)
+      .max(64)
+      .regex(/^[a-z0-9._-]+$/, "lowercase letters, digits, dot, underscore, hyphen"),
+    // The bootstrap password must satisfy the same strong policy as Account
+    // Settings password changes: 12+ chars, mixed case, digit, symbol.
+    ADMIN_PASSWORD: z
+      .string()
+      .min(PASSWORD_POLICY.minLength, "minimum 12 characters")
+      .max(PASSWORD_POLICY.maxLength)
+      .regex(/[a-z]/, "one lowercase letter")
+      .regex(/[A-Z]/, "one uppercase letter")
+      .regex(/[0-9]/, "one digit")
+      .regex(/[^A-Za-z0-9]/, "one symbol"),
+    ADMIN_EMAIL: z.email().max(254),
 
-  // --- SMTP --------------------------------------------------------------------
-  SMTP_HOST: z.string().trim().min(1).max(253),
-  SMTP_PORT: z.coerce.number().int().min(1).max(65535),
-  SMTP_SECURE: z.enum(["true", "false"]).default("false"),
-  SMTP_USER: z.string().max(254).default(""),
-  SMTP_PASSWORD: z.string().max(512).default(""),
-  SMTP_FROM: z.email().max(254),
-  SMTP_DEV_CAPTURE: z.enum(["true", "false"]).default("false"),
-  SMTP_DEV_OUTBOX: z.string().max(512).default(".dev-outbox"),
+    // --- Supabase ---------------------------------------------------------------
+    NEXT_PUBLIC_SUPABASE_URL: z.url(),
+    NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(20),
+    SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
 
-  // --- Firm logo storage (Phase 2) ----------------------------------------------
-  // "supabase" (default) — dedicated Supabase Storage bucket "firm-logos".
-  // "local" — development/staging adapter that stores files on disk and serves
-  //           them through the /uploads route (used by the verification
-  //           harness, which has no Storage API). NEVER set "local" in
-  //           production.
-  FIRM_LOGO_STORAGE_MODE: z.enum(["supabase", "local"]).default("supabase"),
+    // --- SMTP --------------------------------------------------------------------
+    SMTP_HOST: z.string().trim().min(1).max(253),
+    SMTP_PORT: z.coerce.number().int().min(1).max(65535),
+    SMTP_SECURE: z.enum(["true", "false"]).default("false"),
+    SMTP_USER: z.string().max(254).default(""),
+    SMTP_PASSWORD: z.string().max(512).default(""),
+    SMTP_FROM: z.email().max(254),
+    SMTP_DEV_CAPTURE: z.enum(["true", "false"]).default("false"),
+    SMTP_DEV_OUTBOX: z.string().max(512).default(".dev-outbox"),
 
-  // --- Secrets -------------------------------------------------------------------
-  AUTH_SESSION_SECRET: z.string().min(32).max(512),
-  OTP_SECRET: z.string().min(32).max(512),
+    // --- Logo storage (Phases 2 & 3) ----------------------------------------------
+    // "supabase" (default) — dedicated Supabase Storage buckets (firm-logos,
+    //   corporation-logos) written by the service-role client.
+    // "local" — development/staging adapter that stores files on disk and
+    //   serves them through the /uploads route (used by the verification
+    //   harness, which has no Storage API). NEVER set "local" in production.
+    // LOGO_STORAGE_MODE is canonical; FIRM_LOGO_STORAGE_MODE is a legacy
+    // Phase 2 alias that still takes effect when only it is set.
+    LOGO_STORAGE_MODE: storageModeSchema.optional(),
+    FIRM_LOGO_STORAGE_MODE: storageModeSchema.optional(),
 
-  // --- Application -----------------------------------------------------------------
-  APP_URL: z.url(),
-});
+    // --- Secrets -------------------------------------------------------------------
+    AUTH_SESSION_SECRET: z.string().min(32).max(512),
+    OTP_SECRET: z.string().min(32).max(512),
+
+    // --- Application -----------------------------------------------------------------
+    APP_URL: z.url(),
+  })
+  .transform((raw) => ({
+    ...raw,
+    LOGO_STORAGE_MODE: raw.LOGO_STORAGE_MODE ?? raw.FIRM_LOGO_STORAGE_MODE ?? ("supabase" as const),
+  }));
 
 export type ServerEnv = z.infer<typeof envSchema>;
 

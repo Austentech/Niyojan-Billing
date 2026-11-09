@@ -23,7 +23,6 @@ import { createHmac, randomBytes } from "node:crypto";
 import path from "node:path";
 import http from "node:http";
 import pg from "pg";
-import { startPrefixProxy } from "./proxy.mjs";
 
 const run = promisify(execFile);
 
@@ -205,6 +204,9 @@ async function main() {
     console.log(`[harness] applying migration supabase/migrations/${name} ...`);
     await app.query(sql);
   }
+  // PostgREST (when already running from an earlier session) caches the DB
+  // schema — tell it to reload so freshly applied tables/RPCs are visible.
+  await app.query("notify pgrst, 'reload schema'");
   await app.end();
 
   /* 3. JWT secrets ------------------------------------------------------------- */
@@ -237,8 +239,28 @@ async function main() {
   await waitForTcp(POSTGREST_PORT);
 
   /* 5. /rest/v1 prefix proxy ------------------------------------------------------ */
-  const proxyServer = await startPrefixProxy();
-  console.log(`[harness] rest/v1 prefix proxy on :${PROXY_PORT}`);
+  // The proxy runs as its own DETACHED daemon (like PostgREST and PostgreSQL),
+  // so the full stack survives independently of whoever started it. stop.mjs
+  // shuts it down through the loopback-only DELETE /__harness_shutdown__.
+  try {
+    const shutdown = http.request(
+      { host: "127.0.0.1", port: PROXY_PORT, method: "DELETE", path: "/__harness_shutdown__" },
+      () => {},
+    );
+    shutdown.on("error", () => {});
+    shutdown.end();
+    await new Promise((r) => setTimeout(r, 400));
+  } catch {
+    /* nothing listening — fresh start */
+  }
+  console.log("[harness] starting rest/v1 prefix proxy on :" + PROXY_PORT + " ...");
+  spawnDetached(
+    process.execPath,
+    [path.join(HARNESS_DIR, "proxy.mjs")],
+    { ...process.env, HARNESS_PROXY_PORT: String(PROXY_PORT), HARNESS_POSTGREST_PORT: String(POSTGREST_PORT) },
+    path.join(HARNESS_DIR, "logs/proxy.log"),
+  );
+  await waitForTcp(PROXY_PORT);
 
   /* 6. Write the real keys into the app .env -------------------------------------- */
   let env = readFileSync(APP_ENV, "utf8");
@@ -254,8 +276,6 @@ async function main() {
       2,
     ),
   );
-
-  /* 7. Smoke checks ------------------------------------------------------------------ */
   const probe = await new Promise((resolve) => {
     const req = http.request(
       {
@@ -287,8 +307,8 @@ async function main() {
     process.exitCode = 1;
   }
 
-  // Keep the process alive holding the proxy server.
-  setInterval(() => {}, 1 << 30);
+  // All harness components (PostgreSQL, PostgREST, prefix proxy) now run as
+  // independent daemons — nothing to keep alive here.
 }
 
 main().catch((err) => {

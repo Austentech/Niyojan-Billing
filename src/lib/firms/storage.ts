@@ -2,11 +2,16 @@ import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import sharp from "sharp";
-
 import { getServerEnv } from "@/lib/config/env";
 import { getSupabaseServiceClient } from "@/lib/auth/server/db";
 import { FIRM_LOGO_BUCKET, FIRM_LOGO_LOCAL_DIR, FIRM_LOGO_POLICY, FIRM_LOGO_PUBLIC_PREFIX } from "@/lib/constants";
+import {
+  detectImageMime as codecDetectImageMime,
+  extensionForMime,
+  mimeForExtension,
+  normalizeImage,
+  type ImageMime,
+} from "@/lib/storage/image-codec";
 import { PublicFirmError, SystemFirmError, logFirmEvent } from "@/lib/firms/errors";
 
 /**
@@ -15,10 +20,9 @@ import { PublicFirmError, SystemFirmError, logFirmEvent } from "@/lib/firms/erro
  *   1. Size limit (2 MB) checked on the actual buffer.
  *   2. Content type determined by MAGIC BYTES, never by the client-supplied
  *      filename or Content-Type header (a .png-named text file is rejected).
- *   3. The image is fully re-encoded with sharp: this proves it decodes as a
- *      real image, strips EXIF/metadata, caps the dimensions (512px box, no
- *      upscaling) and removes any trailing junk after the image payload —
- *      neutralizing polyglot payloads.
+ *   3. The image is fully re-encoded (shared codec in
+ *      src/lib/storage/image-codec.ts): proves it decodes, strips EXIF,
+ *      caps dimensions (512 px box, no upscaling), removes trailing junk.
  *   4. The stored filename is a server-generated UUID + whitelisted
  *      extension — no user-controlled characters ever reach a path.
  *
@@ -29,66 +33,20 @@ import { PublicFirmError, SystemFirmError, logFirmEvent } from "@/lib/firms/erro
  *     only through the sanitized /uploads/[...path] route handler.
  */
 
-export type LogoMime = (typeof FIRM_LOGO_POLICY.mimeTypes)[number];
-
-const EXT_BY_MIME: Record<LogoMime, string> = {
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/webp": "webp",
-};
+/** Kept for backwards compatibility with existing imports. */
+export type LogoMime = ImageMime;
 
 /** Strict filename pattern for locally stored logos (UUID + extension). */
 export const LOCAL_LOGO_FILENAME_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpg|webp)$/;
 
-const MIME_BY_EXT: Record<string, string> = {
-  png: "image/png",
-  jpg: "image/jpeg",
-  webp: "image/webp",
-};
-
-/** Detect the image type from magic bytes; null when unrecognized. */
-export function detectImageMime(bytes: Buffer): LogoMime | null {
-  if (
-    bytes.length >= 8 &&
-    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
-    bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a
-  ) {
-    return "image/png";
-  }
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
-    return "image/jpeg";
-  }
-  if (
-    bytes.length >= 12 &&
-    bytes.toString("ascii", 0, 4) === "RIFF" &&
-    bytes.toString("ascii", 8, 12) === "WEBP"
-  ) {
-    return "image/webp";
-  }
-  return null;
+export function detectImageMime(bytes: Buffer): ImageMime | null {
+  return codecDetectImageMime(bytes);
 }
 
-/** Full decode + normalize + re-encode; throws PublicFirmError on failure. */
-async function normalizeLogo(bytes: Buffer, mime: LogoMime): Promise<Buffer> {
-  try {
-    let pipeline = sharp(bytes, { failOn: "error", animated: false }).rotate(); // auto-orient via EXIF, then strip it
-    const maxDim = FIRM_LOGO_POLICY.maxDimension;
-    pipeline = pipeline.resize({
-      width: maxDim,
-      height: maxDim,
-      fit: "inside",
-      withoutEnlargement: true,
-    });
-    if (mime === "image/png") {
-      return await pipeline.png({ compressionLevel: 9 }).toBuffer();
-    }
-    if (mime === "image/jpeg") {
-      return await pipeline.jpeg({ quality: 86 }).toBuffer();
-    }
-    return await pipeline.webp({ quality: 86 }).toBuffer();
-  } catch {
-    throw new PublicFirmError("The logo file could not be read as a valid image.", "logo_invalid");
-  }
+/** Content type for a local-mode logo extension (whitelist only). */
+export function localLogoContentType(filename: string): string | null {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  return mimeForExtension(ext);
 }
 
 /**
@@ -108,16 +66,21 @@ export async function storeFirmLogo(rawBytes: Buffer): Promise<string> {
     throw new PublicFirmError("Firm logo must be a PNG, JPG, JPEG or WebP image.", "logo_unsupported");
   }
 
-  const normalized = await normalizeLogo(rawBytes, mime);
+  let normalized: Buffer;
+  try {
+    normalized = await normalizeImage(rawBytes, mime, FIRM_LOGO_POLICY.maxDimension);
+  } catch {
+    throw new PublicFirmError("The logo file could not be read as a valid image.", "logo_invalid");
+  }
   if (normalized.length > FIRM_LOGO_POLICY.maxBytes) {
     throw new PublicFirmError("Firm logo must be at most 2 MB after processing.", "logo_too_large");
   }
 
-  const ext = EXT_BY_MIME[mime];
+  const ext = extensionForMime(mime);
   const filename = `${randomUUID()}.${ext}`;
   const env = getServerEnv();
 
-  if (env.FIRM_LOGO_STORAGE_MODE === "supabase") {
+  if (env.LOGO_STORAGE_MODE === "supabase") {
     const storage = getSupabaseServiceClient().storage.from(FIRM_LOGO_BUCKET);
     const { error } = await storage.upload(filename, normalized, {
       contentType: mime,
@@ -145,10 +108,4 @@ export async function storeFirmLogo(rawBytes: Buffer): Promise<string> {
 export function localFirmLogoPath(filename: string): string | null {
   if (!LOCAL_LOGO_FILENAME_PATTERN.test(filename)) return null;
   return path.resolve(process.cwd(), FIRM_LOGO_LOCAL_DIR, filename);
-}
-
-/** Content type for a local-mode logo extension (whitelist only). */
-export function localLogoContentType(filename: string): string | null {
-  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-  return MIME_BY_EXT[ext] ?? null;
 }

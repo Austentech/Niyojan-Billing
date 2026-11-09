@@ -1,9 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { Loader2, ShieldCheck, TriangleAlert } from "lucide-react";
+import { Check, Loader2, ShieldCheck, TriangleAlert, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -12,17 +12,34 @@ import { Label } from "@/components/ui/label";
 import { PasswordInput } from "@/components/auth/password-input";
 import { changePasswordAction } from "@/server/actions/account-actions";
 import { passwordChangeFormSchema, type PasswordChangeFormInput } from "@/lib/auth/validation";
-import type { PasswordActionState } from "@/types/firms";
+import { PASSWORD_POLICY } from "@/lib/constants";
+import type { PasswordActionState } from "@/types/account";
 
 /**
  * Account Settings — password change.
  *
  *   * Client-side Zod mirrors the server schema (UX only; the server action
  *     re-validates authoritatively).
+ *   * STRONG policy: at least 12 characters with uppercase, lowercase, number
+ *     and special character — live checklist mirrors the server rules.
  *   * The new password is Argon2id-hashed server-side; plaintext never
  *     reaches the database, logs or responses.
- *   * On success every OTHER session is revoked server-side.
+ *   * On success every OTHER session is revoked server-side; this session
+ *     stays valid.
  */
+
+const PASSWORD_REQUIREMENTS = [
+  {
+    key: "length",
+    label: `At least ${PASSWORD_POLICY.minLength} characters`,
+    test: (v: string) => v.length >= PASSWORD_POLICY.minLength,
+  },
+  { key: "lower", label: "One lowercase letter", test: (v: string) => /[a-z]/.test(v) },
+  { key: "upper", label: "One uppercase letter", test: (v: string) => /[A-Z]/.test(v) },
+  { key: "digit", label: "One number", test: (v: string) => /[0-9]/.test(v) },
+  { key: "symbol", label: "One special character (e.g. ! @ # $)", test: (v: string) => /[^A-Za-z0-9]/.test(v) },
+] as const;
+
 export function PasswordChangeForm({ csrfToken }: { csrfToken: string }) {
   const [serverState, setServerState] = useState<PasswordActionState>({ status: "idle" });
   const [submitting, setSubmitting] = useState(false);
@@ -31,6 +48,12 @@ export function PasswordChangeForm({ csrfToken }: { csrfToken: string }) {
     resolver: zodResolver(passwordChangeFormSchema),
     defaultValues: { currentPassword: "", newPassword: "", confirmPassword: "" },
   });
+
+  const newPassword = form.watch("newPassword");
+  const requirementStates = useMemo(
+    () => PASSWORD_REQUIREMENTS.map((requirement) => ({ ...requirement, met: requirement.test(newPassword ?? "") })),
+    [newPassword],
+  );
 
   async function onSubmit(values: PasswordChangeFormInput) {
     setServerState({ status: "idle" });
@@ -44,7 +67,9 @@ export function PasswordChangeForm({ csrfToken }: { csrfToken: string }) {
       const result = await changePasswordAction({ status: "idle" }, formData);
       setServerState(result);
       if (result.status === "success") {
-        toast.success(result.message);
+        toast.success(result.message, {
+          description: "Use the new password at your next sign-in — the environment credentials no longer apply.",
+        });
         form.reset();
       } else if (result.status === "unauthorized") {
         toast.error(result.message);
@@ -117,7 +142,7 @@ export function PasswordChangeForm({ csrfToken }: { csrfToken: string }) {
         <PasswordInput
           id="newPassword"
           autoComplete="new-password"
-          placeholder="At least 10 characters"
+          placeholder={`At least ${PASSWORD_POLICY.minLength} characters`}
           aria-invalid={Boolean(newError)}
           aria-describedby={newError ? "newPassword-error" : "newPassword-hint"}
           {...form.register("newPassword")}
@@ -128,9 +153,27 @@ export function PasswordChangeForm({ csrfToken }: { csrfToken: string }) {
           </p>
         ) : (
           <p id="newPassword-hint" className="text-[12px] text-muted-foreground">
-            10–128 characters. Stored only as an Argon2id hash.
+            {PASSWORD_POLICY.minLength}–{PASSWORD_POLICY.maxLength} characters · stored only as an Argon2id hash.
           </p>
         )}
+        <ul aria-label="Password requirements" className="mt-2 space-y-1.5">
+          {requirementStates.map((requirement) => (
+            <li
+              key={requirement.key}
+              className={
+                "flex items-center gap-1.5 text-xs transition-colors " +
+                (requirement.met ? "text-foreground" : "text-muted-foreground")
+              }
+            >
+              {requirement.met ? (
+                <Check className="size-3.5 shrink-0 text-gold" aria-hidden="true" />
+              ) : (
+                <X className="size-3.5 shrink-0" aria-hidden="true" />
+              )}
+              {requirement.label}
+            </li>
+          ))}
+        </ul>
       </div>
 
       <div className="space-y-1.5">

@@ -1,8 +1,9 @@
-# Security Documentation — Phase 1 Authentication & Phase 2 Firm Management
+# Security Documentation — Phases 1–3 (Authentication, Firm Management, Account Settings)
 
-This document explains every security control in the authentication system and
-the firm-management surface, the reasoning behind the global lockout design,
-and the operational procedures an administrator of this system needs.
+This document explains every security control in the authentication system, the
+firm-management surface and the Account Settings module, the reasoning behind
+the global lockout design, and the operational procedures an administrator of
+this system needs.
 
 ---
 
@@ -10,7 +11,9 @@ and the operational procedures an administrator of this system needs.
 
 - §1–§8 — Phase 1 authentication (unchanged, fully in force)
 - §9 — Phase 2: firm management & file-upload security
-- §10 — Phase 2: storage adapters and what production must use
+- §10 — Storage adapters and what production must use (Phases 2 & 3)
+- §11 — Phase 3: Account Settings security (profile separation, email-change
+  verification, password change, logo protection)
 
 ## 1. Authentication architecture
 
@@ -131,14 +134,18 @@ programmatic form.
   (19 MiB / t=2 / p=1). The insert is an idempotent
   `INSERT … ON CONFLICT (username) DO NOTHING` — race-safe.
 - **Never overwrite:** bootstrap only ever *creates*. Once
-  `credentials_source` flips to `database` (future Account Settings password
-  change), environment values are permanently ignored — startup can never roll a
-  changed password back. The integration test asserts this by mutating the row and
-  re-running bootstrap.
-- **Future change flow (Account Settings phase):** verify current password →
-  Argon2id-hash the new one → update `password_hash`, set
-  `credentials_source = 'database'`, `password_updated_at = now()`, revoke all
-  existing sessions.
+  `credentials_source` flips to `database` (the Phase 3 Account Settings
+  password change), environment values are permanently ignored — startup can
+  never roll a changed password back. The integration tests assert this by
+  mutating the row and re-running bootstrap.
+- **Change flow (Account Settings, Phase 3):** verify current password →
+  validate the new one against the strong policy (12–128 characters with
+  uppercase, lowercase, digit and symbol) → Argon2id-hash it → update
+  `password_hash`, set `credentials_source = 'database'`,
+  `password_updated_at = now()`, revoke every OTHER session (the session that
+  completed the change survives so the administrator is not signed out
+  mid-flow; the next sign-in uses the new credential). The environment
+  bootstrap password must satisfy the same policy at creation time.
 - Plaintext passwords are never stored, never logged, never returned to any
   client (`password_hash` is stripped from every DTO).
 
@@ -166,7 +173,7 @@ programmatic form.
 | SQL injection | Every query goes through the Supabase query builder / typed RPC calls (PostgREST parameter binding). No string-concatenated SQL anywhere. |
 | XSS | React escaping only; no `dangerouslySetInnerHTML`. CSP: `default-src 'self'`, `script-src 'self' nonce-… 'strict-dynamic'` (production), `object-src 'none'`, `frame-ancestors 'none'` (production). |
 | CSRF | SameSite=Lax cookies + Server-Action origin checks + explicit Origin/Host validation + HttpOnly double-submit CSRF token verified on every mutating action. |
-| Rate limiting | PostgreSQL atomic fixed-window counters shared by all instances: login 10/5 min, OTP verify 12/5 min, OTP issue 6/hour, resend cooldown 60 s. Fails closed. |
+| Rate limiting | PostgreSQL atomic fixed-window counters shared by all instances: login 10/5 min, OTP verify 12/5 min, OTP issue 6/hour, resend cooldown 60 s; account writes: password change 5/hour, profile update 10/hour, email-change codes 6/hour + 60 s cooldown, email-change verification 12/10 min. Fails closed. |
 | Brute force | Global lockout (§3) + per-challenge OTP attempt cap (5) + Argon2id cost. |
 | Session fixation | Fresh random token per authentication (§5). |
 | Enumeration | Identical error message and near-identical timing for wrong-username vs wrong-password (dummy Argon2id verification equalizes the timing). |
@@ -284,23 +291,99 @@ to `http(s)://` at validation time and rendered with
 
 ### CSRF on write operations
 
-`createFirmAction` and `changePasswordAction` run the same guard chain as the
-authentication actions: Server-Action origin enforcement, explicit
-Origin/Host validation against `APP_URL`, the HttpOnly double-submit CSRF
-token, and SameSite=Lax session cookies.
+`createFirmAction` and every Phase 3 account action
+(`updateCorporationProfileAction`, `requestEmailChangeAction`,
+`confirmEmailChangeAction`, `resendEmailChangeCodeAction`,
+`changePasswordAction`) run the same guard chain as the authentication
+actions: Server-Action origin enforcement, explicit Origin/Host validation
+against `APP_URL`, the HttpOnly double-submit CSRF token, and SameSite=Lax
+session cookies.
 
 ## 10. Phase 2 — storage adapters
 
 | Mode | Use | Behaviour |
 | --- | --- | --- |
-| `supabase` (default) | Production & any real Supabase project | Uploads to the `firm-logos` bucket with the service role; public URLs from Supabase Storage. Bucket-level MIME + size limits (set in migration 0002) act as a second enforcement layer. |
-| `local` | Bundled verification harness / offline staging only | Writes the *same hardened, re-encoded* bytes to `.data/firm-logos` and serves them via the sanitized `/uploads` route. |
+| `supabase` (default) | Production & any real Supabase project | Uploads to the `firm-logos` / `corporation-logos` buckets with the service role; public URLs from Supabase Storage. Bucket-level MIME + size limits (set in migrations 0002/0003) act as a second enforcement layer. |
+| `local` | Bundled verification harness / offline staging only | Writes the *same hardened, re-encoded* bytes to `.data/firm-logos` / `.data/corporation-logos` and serves them via the sanitized `/uploads` route. |
 
-Both adapters run the identical validation pipeline — the only difference is
-the persistence target. The `local` adapter is a development convenience for
-the harness (which has no Storage API); setting it in production is a
+Both adapters run the identical validation pipeline (`LOGO_STORAGE_MODE`;
+`FIRM_LOGO_STORAGE_MODE` remains a legacy Phase 2 alias) — the only difference
+is the persistence target. The `local` adapter is a development convenience
+for the harness (which has no Storage API); setting it in production is a
 configuration error (it is documented as such in `.env.example`).
 
-Operational note: if a firm insert fails *after* a logo was stored, the logo
+Operational note: if an insert fails *after* a logo was stored, the logo
 file/bucket object is orphaned (harmless, logged); housekeeping can remove
-objects not referenced by `firms.logo_url`.
+objects not referenced by `firms.logo_url` / `corporation_profile.logo_url`.
+
+---
+
+## 11. Phase 3 — Account Settings security
+
+### Separation of concerns
+
+The corporation profile (name, logo) lives in `corporation_profile` — its own
+RLS-locked table, **completely separate** from the authentication
+configuration in `admin_accounts`. Only the sign-in identity (username,
+password, email) and the display name remain on the administrator row; brand
+data never mixes with credentials.
+
+### Authorization model
+
+- `/settings/account` is protected exactly like every authenticated route
+  (edge-proxy fast path + layout + page re-validation, all database-backed).
+- The **only** state-changing account endpoints are the five Server Actions
+  listed in §9 (CSRF guard chain). Each refuses to run without a valid
+  administrator session; there is deliberately no unauthenticated account
+  surface.
+- `corporation_profile` and `email_change_requests` carry RLS with **zero**
+  policies; all access flows through the service role from server code only
+  (asserted by the test suite, including the RPC execute revokes — an anon
+  key cannot invoke `account_consume_email_change`).
+
+### Email change — verification-gated activation
+
+Changing the administrator email (the delivery target for sign-in codes) is a
+**two-step, verified** flow:
+
+1. **Request:** the new address is validated (format, differs from the current
+   one, not claimed by any administrator — case-insensitive) and an 8-character
+   code is emailed **to the new address only**. Only
+   `HMAC-SHA256(code, OTP_SECRET)` is stored; the request expires after 10
+   minutes, allows max 5 wrong attempts, is single-use, and issuing a new
+   request retires every previous one. Code issuance is capped at 6/hour with
+   a 60-second cooldown; re-requesting the same pending address is idempotent
+   (no duplicate code, no cooldown burn). The **current email stays active**
+   the whole time.
+2. **Confirmation:** the atomic SECURITY DEFINER function
+   `account_consume_email_change(p_admin_id, p_code_hash)` verifies the code
+   AND swaps `admin_accounts.email` in a single transaction (row-locked,
+   race-free). An expired, exhausted or already-consumed request can never
+   flip the address. The code never appears in responses or logs.
+
+### Password change
+
+See §4. The current password is verified against the stored Argon2id hash
+before anything is written; weak candidates are rejected by the shared strong
+policy; every other session is revoked on success.
+
+### Logo upload protection
+
+The corporation logo runs through the **same hardened pipeline** as firm
+logos (§9) via the shared image codec (`src/lib/storage/image-codec.ts`):
+magic-byte sniffing, sharp re-encode (EXIF stripped, 512 px cap), 2 MB limit,
+server-generated UUID filenames, dedicated `corporation-logos` bucket
+(bucket-level MIME/size limits) or the sanitized `/uploads/corporation-logos`
+route in the dev adapter (traversal impossible). Serving carries
+`nosniff` and a whitelist content type.
+
+### Information exposure
+
+- The stored password hash is never displayed or returned by any endpoint.
+- Pending email changes are surfaced **masked** (first letter + dots).
+- Verification codes appear only inside the outgoing emails.
+- Errors follow the established taxonomy: public-safe messages for validation
+  outcomes, generic "temporarily unavailable" for system failures (detail
+  only in server logs).
+- Timestamps render in the reader's local timezone client-side; the database
+  stores UTC (`last_login_at` is written only on fully successful OTP login).

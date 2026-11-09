@@ -11,6 +11,7 @@
     "test:unit": "tsx scripts/test-unit.ts",
     "test:auth": "tsx scripts/test-auth.ts",
     "test:firms": "tsx scripts/test-firms.ts",
+    "test:account": "tsx scripts/test-account.ts",
     "harness:start": "node verify-harness/start.mjs",
     "harness:stop": "node verify-harness/stop.mjs"
   },

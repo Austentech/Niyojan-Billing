@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { OTP_CHARSET, OTP_LENGTH, OTP_TTL_SECONDS } from "@/lib/constants";
+import { OTP_CHARSET, OTP_LENGTH, OTP_TTL_SECONDS, PASSWORD_POLICY } from "@/lib/constants";
 
 /**
  * Zod schemas shared by client (inline field validation) and server
@@ -46,14 +46,19 @@ export const OTP_TTL_MINUTES = Math.round(OTP_TTL_SECONDS / 60);
 
 /**
  * Account Settings — password change (shared by client form and server
- * action). The new credential must satisfy the bootstrap-grade policy.
+ * action). STRONG policy: minimum 12 characters with uppercase, lowercase,
+ * number and special character (mirrors the environment bootstrap policy).
  */
 export const passwordChangeSchema = z.object({
   currentPassword: z.string().min(1, "Enter your current password.").max(128),
   newPassword: z
     .string()
-    .min(10, "The new password must be at least 10 characters.")
-    .max(128, "The new password must be at most 128 characters.")
+    .min(PASSWORD_POLICY.minLength, `The new password must be at least ${PASSWORD_POLICY.minLength} characters.`)
+    .max(PASSWORD_POLICY.maxLength, `The new password must be at most ${PASSWORD_POLICY.maxLength} characters.`)
+    .refine((v) => /[a-z]/.test(v), "The new password must include a lowercase letter.")
+    .refine((v) => /[A-Z]/.test(v), "The new password must include an uppercase letter.")
+    .refine((v) => /[0-9]/.test(v), "The new password must include a number.")
+    .refine((v) => /[^A-Za-z0-9]/.test(v), "The new password must include a special character (e.g. ! @ # $).")
     .refine((v) => v !== "timing-equalization-placeholder", "Choose a stronger password."),
 });
 

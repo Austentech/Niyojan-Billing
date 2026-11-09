@@ -51,28 +51,32 @@ interface SessionAdminJoin {
   admin_accounts: { id: string; display_name: string; username: string; email: string; is_active: boolean } | null;
 }
 
-/** Create a fresh session row and return the cookie token. */
+/** Create a fresh session row and return the cookie token + row id. */
 export async function createSession(
   adminId: string,
   meta: AuthAttemptMeta,
-): Promise<{ token: string; expiresAt: string }> {
+): Promise<{ token: string; sessionId: string; expiresAt: string }> {
   const token = generateSessionToken();
   const expiresAt = new Date(Date.now() + SESSION_ABSOLUTE_TTL_SECONDS * 1000).toISOString();
 
-  const { error } = await getSupabaseServiceClient().from("admin_sessions").insert({
-    admin_id: adminId,
-    token_hash: sha256Hex(token),
-    expires_at: expiresAt,
-    last_seen_at: new Date().toISOString(),
-    ip_address: meta.ipAddress,
-    user_agent: meta.userAgent,
-  });
-  if (error) {
+  const { data, error } = await getSupabaseServiceClient()
+    .from("admin_sessions")
+    .insert({
+      admin_id: adminId,
+      token_hash: sha256Hex(token),
+      expires_at: expiresAt,
+      last_seen_at: new Date().toISOString(),
+      ip_address: meta.ipAddress,
+      user_agent: meta.userAgent,
+    })
+    .select("id")
+    .single<{ id: string }>();
+  if (error || !data) {
     throw dbSystemError("admin_sessions.insert", error);
   }
 
   logAuthEvent("session_created", { admin_id: adminId });
-  return { token, expiresAt };
+  return { token, sessionId: data.id, expiresAt };
 }
 
 function toContext(row: SessionAdminJoin): SessionContext {

@@ -1,12 +1,13 @@
-# Testing Documentation — Phase 1 Authentication & Phase 2 Firm Management
+# Testing Documentation — Phases 1–3 (Authentication, Firm Management, Account Settings)
 
 ## Automated suites
 
 | Suite | Command | Needs database | Coverage |
 | --- | --- | --- | --- |
-| Unit | `npx tsx scripts/test-unit.ts` | No | OTP generation/hashing, normalization, Zod schemas, pre-auth cookie signing (tamper/expiry), Argon2id roundtrip, email masking, env validation hygiene |
+| Unit | `npx tsx scripts/test-unit.ts` | No | OTP generation/hashing, normalization, Zod schemas (incl. the strong 12-char password policy), pre-auth cookie signing (tamper/expiry), Argon2id roundtrip, email masking, env validation hygiene |
 | Integration (auth) | `npx tsx scripts/test-auth.ts` | Yes (staging or local harness) | The full 13-scenario Phase 1 matrix + extras |
 | Integration (firms) | `npx tsx scripts/test-firms.ts` | Yes (staging or local harness) | The full 12-scenario Phase 2 matrix + extras |
+| Integration (account) | `npx tsx scripts/test-account.ts` | Yes (staging or local harness) | The full 12-scenario Phase 3 matrix + extras |
 
 Run the unit suite first (it also sanity-checks the `.env` contract), then the
 integration suites.
@@ -64,6 +65,34 @@ escaped (no raw HTML); the Account-Settings password change produces a valid
 Argon2id hash, invalidates the old credential, flips `credentials_source` to
 `database`, and survives bootstrap re-runs without being rolled back.
 
+## The Phase 3 required scenarios → automated assertions
+
+All 12 are asserted by `scripts/test-account.ts` (139 checks total), which runs
+the same account service/storage layers the application uses against the real
+PostgreSQL + PostgREST stack, plus HTTP-level checks against the dev server
+with a genuine session cookie:
+
+| # | Required scenario | Assertions in the suite |
+| --- | --- | --- |
+| 1 | Displaying account information | `getAccountOverview` returns the administrator identity from the account configuration (name/email/username), the seeded corporation profile (name, NULL logo → official asset), credential source and the database `last_login_at`; authenticated `GET /settings/account` renders the overview card, corporation name, administrator name/email, last-login field and UTC-format timestamps (the local-timezone swap is client-side, browser-verified); unauthenticated request → 307 |
+| 2 | Updating corporation name | `updateCorporationProfile` → database row updated and reflected in the overview + a freshly-rendered page; empty / 1-char / 121-char names rejected with field errors; nothing written on invalid input; the DB CHECK constraint rejects a bad name even when the app is bypassed |
+| 3 | Updating administrator name | `updateDisplayName` → database + active session context + dashboard greeting all reflect the new name immediately; 1-char name rejected; unknown administrator reported, never created |
+| 4 | Updating administrator email with verification | Request → code emailed to the NEW address only (.eml captured, To-header checked, 8-char charset); only the HMAC hash stored; current email stays active; wrong code rejected + burns one attempt; correct code → email activated atomically, request consumed, code single-use; reuse → `not_found`; same-address re-request is idempotent; cooldown blocks immediate re-requests; expired request → `expired`; five wrong codes → `too_many_attempts`; malformed/same-address requests rejected; RLS blocks anon on `corporation_profile`, `email_change_requests` and the consume RPC |
+| 5 | Changing corporation logo | Real PNG stored through the hardened pipeline (magic bytes, sharp re-encode, 512 px cap, UUID filename in its own `corporation-logos` area); profile updated; page renders the custom URL; served with `image/png` + `nosniff`; text-spoofed / empty / >2 MB / truncated payloads rejected; `/uploads` traversal + unrelated areas → 404; removing the logo restores the official brand asset |
+| 6 | Successful password update | `changeAdminPassword` with the correct current password → hash changed (Argon2id), `credentials_source='database'`, `password_updated_at` refreshed; new password verifies, old fails; every OTHER session revoked while the current one stays valid; bootstrap re-run never rolls the credential back |
+| 7 | Incorrect current password | → `wrong_current`; the stored hash is untouched; re-using the same password is rejected |
+| 8 | Password mismatch | The client+server shared schema rejects a confirmation that differs from the new password (error points at the confirmation field); matching values pass |
+| 9 | Weak password rejection | 11 chars / no-uppercase / no-lowercase / no-digit / no-symbol each rejected by the strong policy; a compliant 12+ char password accepted |
+| 10 | Login using the newly updated password | `submitCredentials` with the new password → OTP issued and delivered to the newly verified email; full OTP verification completes; login with the old password → `invalid_credentials` |
+| 11 | Login using the old password | Explicit re-check: rejected, and the stored hash no longer verifies the old password |
+| 12 | Accurate last-login timestamp | After a successful OTP-authenticated login `last_login_at` is set, differs from the previous value and matches the actual login moment (UTC, seconds-accurate); a credentials-correct but OTP-failed attempt does NOT touch it |
+
+**Extras** (also asserted): the verification code never appears in captured
+console output; pending email changes are surfaced masked for the UI; the
+`corporation_profile` table is fully separate from authentication tables; and
+the suite restores the pristine bootstrap state (name/email/password/credential
+source) so all four suites are re-runnable in any order.
+
 ## Running the integration suites
 
 ### Option A — staging Supabase project (recommended)
@@ -74,8 +103,8 @@ Argon2id hash, invalidates the old credential, flips `credentials_source` to
    order (0001, 0002, …).
 3. Point `.env` at it and set `SMTP_DEV_CAPTURE=true` so codes are written to
    `.dev-outbox/` instead of being emailed.
-4. `npx tsx scripts/test-auth.ts && npx tsx scripts/test-firms.ts`
-   (the firms suite also needs `FIRM_LOGO_STORAGE_MODE=local` when running
+4. `npx tsx scripts/test-auth.ts && npx tsx scripts/test-firms.ts && npx tsx scripts/test-account.ts`
+   (the firms + account suites also need `LOGO_STORAGE_MODE=local` when running
    against the harness — against a real Supabase project keep `supabase`.)
 
 ### Option B — bundled local harness (no Supabase account)
@@ -92,6 +121,7 @@ node verify-harness/start.mjs     # Postgres :5433, PostgREST :5434, /rest/v1 pr
 npx tsx scripts/test-unit.ts      # 46 checks
 npx tsx scripts/test-auth.ts      # 90 checks (Phase 1)
 npx tsx scripts/test-firms.ts     # 91 checks (Phase 2)
+npx tsx scripts/test-account.ts   # 139 checks (Phase 3)
 node verify-harness/stop.mjs      # when finished
 ```
 
@@ -144,8 +174,38 @@ browser during development, driving the actual UI:
 10. No browser console errors or page errors at any point (only the expected
     dev-tool informational notices).
 
+**Phase 3 (browser-driven, after the Phase 3 changes):**
+
+1. Two-step login with the environment bootstrap credentials → dashboard.
+2. `/settings/account` — Account overview renders the corporation name, the
+   official logo, the administrator identity from the account configuration
+   and "Last successful login … (UTC)" in the reader's local timezone
+   (client-side swap after hydration; verified at a UTC-locale browser).
+3. Corporation profile: updating corporation name + administrator display
+   name → success toast → the overview, header greeting and form all reflect
+   the new values immediately (router refresh + server revalidation).
+4. Corporation logo: real PNG upload → success toast → the custom logo
+   renders and persists across a reload; the image loads (`naturalWidth > 0`).
+5. Email change: enter a new address → "Send verification code" → masked
+   confirmation box with expiry countdown and resend cooldown → enter the
+   code from `.dev-outbox` → "…is now <new email>" and the active-email field
+   updates immediately.
+6. Password change: wrong current password → inline error; weak password →
+   field error + live requirements checklist; compliant password → success
+   message and the credential source flips to "Database — set through
+   Account Settings".
+7. Sign out → old password rejected ("Invalid credentials"), new password
+   accepted → OTP email arrives at the newly verified address → verification
+   completes → back on `/dashboard`.
+8. Responsive layout verified by computed styles at 1440 px, 768 px and
+   375 px — zero horizontal overflow at every width (the floating dev-tools
+   button seen in dev screenshots is a Next.js dev-mode overlay, not part of
+   the application).
+9. No browser console errors or page errors at any point.
+
 ## Continuous verification
 
-All suites are idempotent (they reset auth/firm state between scenarios and at
-exit), so they can run repeatedly or in CI. The unit suite doubles as a fast
-pre-commit gate: `npx tsc --noEmit && bun run lint && npx tsx scripts/test-unit.ts`.
+All suites are idempotent (they reset auth/firm/account state between
+scenarios and at exit), so they can run repeatedly, in any order, or in CI.
+The unit suite doubles as a fast pre-commit gate:
+`npx tsc --noEmit && bun run lint && npx tsx scripts/test-unit.ts`.
