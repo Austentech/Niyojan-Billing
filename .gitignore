@@ -40,7 +40,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
-local-*
+# Root-scoped scratch files only. NEVER match source files like
+# src/components/common/local-time.tsx (a bare `local-*` pattern matches at
+# every directory level and silently kept that component out of the repo).
+/local-*
 .claude
 .z-ai-config
 *.log
