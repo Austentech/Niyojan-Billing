@@ -41,6 +41,10 @@ function lockoutState(lockout: LockoutState) {
 
 function mapLoginError(err: unknown): LoginActionState {
   if (err instanceof EnvConfigError) {
+    // Operator diagnostic: EnvConfigError carries variable NAMES ONLY (never
+    // values — see src/lib/config/env.ts), so this log line tells an operator
+    // deployed on Vercel exactly which variables to fix, without leaking them.
+    logAuthError("env_config_invalid", err);
     return {
       status: "config_error",
       message:
