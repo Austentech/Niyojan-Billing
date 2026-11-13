@@ -1,8 +1,10 @@
+import { and, eq, isNull } from "drizzle-orm";
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
+import { getDb } from "@/lib/db";
+import { adminAccounts, adminSessions } from "@/lib/db/schema";
 import { getServerEnv } from "@/lib/config/env";
-import { getSupabaseServiceClient, dbSystemError } from "@/lib/auth/server/db";
-import { logAuthError, logAuthEvent } from "@/lib/auth/errors";
+import { SystemAuthError, logAuthError, logAuthEvent } from "@/lib/auth/errors";
 import type { AuthAttemptMeta, SessionContext } from "@/lib/auth/types";
 import {
   PREAUTH_COOKIE_TTL_SECONDS,
@@ -33,63 +35,42 @@ export function generateSessionToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-interface SessionRow {
-  id: string;
-  admin_id: string;
-  token_hash: string;
-  expires_at: string;
-  last_seen_at: string;
-  revoked_at: string | null;
-}
-
-interface SessionAdminJoin {
-  id: string;
-  admin_id: string;
-  expires_at: string;
-  last_seen_at: string;
-  revoked_at: string | null;
-  admin_accounts: { id: string; display_name: string; username: string; email: string; is_active: boolean } | null;
-}
-
 /** Create a fresh session row and return the cookie token + row id. */
 export async function createSession(
   adminId: string,
   meta: AuthAttemptMeta,
 ): Promise<{ token: string; sessionId: string; expiresAt: string }> {
   const token = generateSessionToken();
-  const expiresAt = new Date(Date.now() + SESSION_ABSOLUTE_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + SESSION_ABSOLUTE_TTL_SECONDS * 1000);
 
-  const { data, error } = await getSupabaseServiceClient()
-    .from("admin_sessions")
-    .insert({
-      admin_id: adminId,
-      token_hash: sha256Hex(token),
-      expires_at: expiresAt,
-      last_seen_at: new Date().toISOString(),
-      ip_address: meta.ipAddress,
-      user_agent: meta.userAgent,
-    })
-    .select("id")
-    .single<{ id: string }>();
-  if (error || !data) {
-    throw dbSystemError("admin_sessions.insert", error);
+  try {
+    const [row] = await getDb()
+      .insert(adminSessions)
+      .values({
+        adminId,
+        tokenHash: sha256Hex(token),
+        expiresAt,
+        lastSeenAt: new Date(),
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+      })
+      .returning({ id: adminSessions.id });
+
+    if (!row) {
+      throw new Error("no row returned");
+    }
+
+    logAuthEvent("session_created", { admin_id: adminId });
+    return { token, sessionId: row.id, expiresAt: expiresAt.toISOString() };
+  } catch (err) {
+    throw dbSessionError("admin_sessions.insert", err);
   }
-
-  logAuthEvent("session_created", { admin_id: adminId });
-  return { token, sessionId: data.id, expiresAt };
 }
 
-function toContext(row: SessionAdminJoin): SessionContext {
-  const admin = row.admin_accounts!;
-  return {
-    sessionId: row.id,
-    adminId: admin.id,
-    displayName: admin.display_name,
-    username: admin.username,
-    email: admin.email,
-    createdAt: row.last_seen_at,
-    expiresAt: row.expires_at,
-  };
+/** Map a driver error to a sanitized SystemAuthError for the server log. */
+function dbSessionError(operation: string, err: unknown): SystemAuthError {
+  const code = err && typeof err === "object" && "code" in err ? String((err as { code?: unknown }).code ?? "") : "";
+  return new SystemAuthError(`postgres ${operation} failed${code ? ` (code ${code})` : ""}`);
 }
 
 /**
@@ -100,64 +81,106 @@ function toContext(row: SessionAdminJoin): SessionContext {
 export async function validateSessionToken(token: string | null | undefined): Promise<SessionContext | null> {
   if (!token || token.length < 20 || token.length > 128) return null;
 
-  const db = getSupabaseServiceClient();
-  const { data, error } = await db
-    .from("admin_sessions")
-    .select(
-      "id, admin_id, expires_at, last_seen_at, revoked_at, admin_accounts(id, display_name, username, email, is_active)",
-    )
-    .eq("token_hash", sha256Hex(token))
-    .maybeSingle<SessionAdminJoin>();
-
-  if (error) {
-    logAuthError("session_lookup_failed", dbSystemError("admin_sessions.select", error));
+  let row:
+    | {
+        id: string;
+        expiresAt: Date;
+        lastSeenAt: Date;
+        revokedAt: Date | null;
+        admin: { id: string; displayName: string; username: string; email: string; isActive: boolean } | null;
+      }
+    | undefined;
+  try {
+    const rows = await getDb()
+      .select({
+        id: adminSessions.id,
+        expiresAt: adminSessions.expiresAt,
+        lastSeenAt: adminSessions.lastSeenAt,
+        revokedAt: adminSessions.revokedAt,
+        adminId: adminAccounts.id,
+        displayName: adminAccounts.displayName,
+        username: adminAccounts.username,
+        email: adminAccounts.email,
+        isActive: adminAccounts.isActive,
+      })
+      .from(adminSessions)
+      .innerJoin(adminAccounts, eq(adminSessions.adminId, adminAccounts.id))
+      .where(eq(adminSessions.tokenHash, sha256Hex(token)))
+      .limit(1);
+    const r = rows[0];
+    row = r
+      ? {
+          id: r.id,
+          expiresAt: r.expiresAt,
+          lastSeenAt: r.lastSeenAt,
+          revokedAt: r.revokedAt,
+          admin: {
+            id: r.adminId,
+            displayName: r.displayName,
+            username: r.username,
+            email: r.email,
+            isActive: r.isActive,
+          },
+        }
+      : undefined;
+  } catch (err) {
+    logAuthError("session_lookup_failed", dbSessionError("admin_sessions.select", err));
     return null;
   }
-  if (!data) return null;
+  if (!row) return null;
 
   const now = Date.now();
-  const admin = data.admin_accounts;
-  if (data.revoked_at || !admin || !admin.is_active) return null;
-  if (Date.parse(data.expires_at) <= now) return null;
-  if (now - Date.parse(data.last_seen_at) > SESSION_IDLE_TIMEOUT_SECONDS * 1000) return null;
+  const admin = row.admin;
+  if (row.revokedAt || !admin || !admin.isActive) return null;
+  if (row.expiresAt.getTime() <= now) return null;
+  if (now - row.lastSeenAt.getTime() > SESSION_IDLE_TIMEOUT_SECONDS * 1000) return null;
 
   // Sliding touch (rate-limited to avoid write amplification).
-  if (now - Date.parse(data.last_seen_at) > SESSION_TOUCH_INTERVAL_SECONDS * 1000) {
-    void db
-      .from("admin_sessions")
-      .update({ last_seen_at: new Date().toISOString() })
-      .eq("id", data.id)
-      .then(({ error: touchError }) => {
-        if (touchError) logAuthError("session_touch_failed", dbSystemError("admin_sessions.update", touchError));
+  if (now - row.lastSeenAt.getTime() > SESSION_TOUCH_INTERVAL_SECONDS * 1000) {
+    void getDb()
+      .update(adminSessions)
+      .set({ lastSeenAt: new Date() })
+      .where(eq(adminSessions.id, row.id))
+      .catch((touchError: unknown) => {
+        logAuthError("session_touch_failed", dbSessionError("admin_sessions.update", touchError));
       });
   }
 
-  return toContext(data);
+  return {
+    sessionId: row.id,
+    adminId: admin.id,
+    displayName: admin.displayName,
+    username: admin.username,
+    email: admin.email,
+    createdAt: row.lastSeenAt.toISOString(),
+    expiresAt: row.expiresAt.toISOString(),
+  };
 }
 
 /** Revoke (logout) — single-use invalidation, survives until cleanup. */
 export async function revokeSessionByToken(token: string | null | undefined): Promise<boolean> {
   if (!token) return false;
-  const { data, error } = await getSupabaseServiceClient()
-    .from("admin_sessions")
-    .update({ revoked_at: new Date().toISOString() })
-    .eq("token_hash", sha256Hex(token))
-    .is("revoked_at", null)
-    .select("id, admin_id")
-    .maybeSingle<SessionRow>();
-  if (error) {
-    logAuthError("session_revoke_failed", dbSystemError("admin_sessions.update", error));
+  try {
+    const rows = await getDb()
+      .update(adminSessions)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(adminSessions.tokenHash, sha256Hex(token)), isNull(adminSessions.revokedAt)))
+      .returning({ id: adminSessions.id, adminId: adminSessions.adminId });
+
+    const row = rows[0];
+    if (row) logAuthEvent("session_revoked", { admin_id: row.adminId });
+    return Boolean(row);
+  } catch (err) {
+    logAuthError("session_revoke_failed", dbSessionError("admin_sessions.update", err));
     return false;
   }
-  if (data) logAuthEvent("session_revoked", { admin_id: data.admin_id });
-  return Boolean(data);
 }
 
 /* ============================================================================
  * Signed pre-OTP cookie (Step 1 -> Step 2 handoff)
  * ----------------------------------------------------------------------------
  * After credentials verify, an HttpOnly cookie carries ONLY
- * { challengeId, adminId, exp } plus an HMAC-SHA256 signature keyed by
+ * { challengeId, adminId } plus an HMAC-SHA256 signature keyed by
  * AUTH_SESSION_SECRET. It is unreadable and unforgeable client-side, expires
  * with the OTP, and never contains the code itself. The OTP screen cannot
  * proceed without it, binding Step 2 to the server-verified Step 1.

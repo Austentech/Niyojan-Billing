@@ -71,3 +71,11 @@ verify-harness/node_modules/
 .data/
 # The annotated environment reference is deliberately tracked.
 !.env.example
+.zscripts/
+
+# Local environment (create yours from .env.example) — never committed
+.env
+# User upload scratch space (input materials, not app assets)
+/upload/
+# Sandbox tooling state
+.zscripts/

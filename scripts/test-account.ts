@@ -29,9 +29,10 @@ import sharp from "sharp";
 import { loadDotEnv } from "./load-env";
 import { check, checkEqual, rejects, section, finish } from "./test-harness";
 
-loadDotEnv(".env");
+loadDotEnv(".env", { override: true });
+/** Owner-level test client + unprivileged probe client (see test-db.ts). */
+import { opsClient, anonClient } from "./test-db";
 
-import { createClient } from "@supabase/supabase-js";
 import { createSession, validateSessionToken } from "../src/lib/auth/server/session";
 import { ensureAdminBootstrapped } from "../src/lib/auth/server/bootstrap";
 import { getAdminByUsername, submitCredentials, verifyOtp, resetGlobalAuthStateForTests } from "../src/lib/auth/service";
@@ -60,19 +61,6 @@ const META = { ipAddress: "127.0.0.1", userAgent: "niyojan-test-suite/1.0" };
 const NEW_EMAIL = "deepak.khurana@niyojan-verified.example";
 const NEW_PASSWORD = "Rotated#Admin2026";
 
-/** Fresh service-role client (independent of the app's cached singleton). */
-function opsClient() {
-  return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-/** Fresh ANON client — proves anonymous access stays blocked. */
-function anonClient() {
-  return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 /** Minimal HTTP helper against the running dev server. */
 function http(url: string, headers: Record<string, string> = {}): { status: string; redirect: string; body: string } {
@@ -608,7 +596,7 @@ async function main(): Promise<void> {
   check(loginDelta < 15_000, "last_login_at matches the actual login moment (UTC, seconds-accurate)");
 
   // Credentials-correct but OTP-failed attempts must NOT touch last_login_at.
-  const preFailedOtp = (await ops.from("admin_accounts").select("last_login_at").eq("id", adminId).maybeSingle()).data?.last_login_at ?? null;
+  const preFailedOtpMs = (await ops.from("admin_accounts").select("last_login_at").eq("id", adminId).maybeSingle()).data?.last_login_at ?? null;
   // Age challenges past the OTP resend cooldown (ops manipulation, as in test-auth).
   await ops
     .from("auth_otp_challenges")
@@ -624,7 +612,11 @@ async function main(): Promise<void> {
   });
   checkEqual(failedOtp.status, "invalid", "the wrong OTP is rejected");
   const postFailedOtp = (await ops.from("admin_accounts").select("last_login_at").eq("id", adminId).maybeSingle()).data?.last_login_at ?? null;
-  checkEqual(postFailedOtp, preFailedOtp, "last_login_at is NOT updated when credentials pass but the OTP fails");
+  checkEqual(
+    postFailedOtp ? new Date(postFailedOtp as string | Date).getTime() : null,
+    preFailedOtpMs ? new Date(preFailedOtpMs as string | Date).getTime() : null,
+    "last_login_at is NOT updated when credentials pass but the OTP fails",
+  );
 
   /* ==========================================================================
    * 11. LOGIN USING THE OLD PASSWORD — already asserted above; explicit re-check

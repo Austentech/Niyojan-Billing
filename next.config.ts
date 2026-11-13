@@ -17,16 +17,6 @@ const nextConfig: NextConfig = {
       bodySizeLimit: "4mb",
     },
   },
-  // Firm logos are served from the project's Supabase Storage bucket
-  // (public URLs on *.supabase.co). Everything else stays same-origin.
-  images: {
-    remotePatterns: [
-      {
-        protocol: "https",
-        hostname: "**.supabase.co",
-      },
-    ],
-  },
 };
 
 export default nextConfig;

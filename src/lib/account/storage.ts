@@ -3,12 +3,12 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { getServerEnv } from "@/lib/config/env";
-import { getSupabaseServiceClient } from "@/lib/auth/server/db";
+import { s3PutObject } from "@/lib/storage/s3";
 import {
-  CORPORATION_LOGO_BUCKET,
   CORPORATION_LOGO_LOCAL_DIR,
   CORPORATION_LOGO_POLICY,
   CORPORATION_LOGO_PUBLIC_PREFIX,
+  CORPORATION_LOGO_S3_PREFIX,
 } from "@/lib/constants";
 import {
   detectImageMime,
@@ -33,10 +33,11 @@ import { PublicAccountError, SystemAccountError, logAccountEvent } from "@/lib/a
  *      user-controlled characters ever reach a path.
  *
  * STORAGE ADAPTERS (LOGO_STORAGE_MODE)
- *   * "supabase" (default, production) — dedicated `corporation-logos`
- *     bucket via the service-role client; public URLs from Supabase Storage.
- *   * "local" (development/harness) — files under .data/corporation-logos,
- *     served only through the sanitized /uploads/[...path] route handler.
+ *   * "s3" (production) — S3-compatible object storage; persistent public URLs.
+ *   * "local" (development/harness only) — files under .data/corporation-logos,
+ *     served through the sanitized /uploads/[...path] route handler.
+ *   * "url" (default) — uploads are NOT offered in the UI; the logo is set by
+ *     a validated http(s) URL instead. Reaching this adapter fails closed.
  */
 
 /** Strict filename pattern for locally stored logos (UUID + extension). */
@@ -77,30 +78,34 @@ export async function storeCorporationLogo(rawBytes: Buffer): Promise<string> {
   }
 
   const ext = extensionForMime(mime);
-  const filename = `${randomUUID()}.${ext}`;
   const env = getServerEnv();
 
-  if (env.LOGO_STORAGE_MODE === "supabase") {
-    const storage = getSupabaseServiceClient().storage.from(CORPORATION_LOGO_BUCKET);
-    const { error } = await storage.upload(filename, normalized, {
-      contentType: mime,
-      upsert: false,
-      cacheControl: "31536000",
-    });
-    if (error) {
-      throw new SystemAccountError(`corporation logo upload failed (${error.statusCode ?? ""})`);
+  if (env.LOGO_STORAGE_MODE === "s3") {
+    const key = `${CORPORATION_LOGO_S3_PREFIX}/${randomUUID()}.${ext}`;
+    let publicUrl: string;
+    try {
+      publicUrl = await s3PutObject({ key, body: normalized, contentType: mime });
+    } catch (err) {
+      throw new SystemAccountError(err instanceof Error ? err.message : "corporation logo upload failed");
     }
-    const { data } = storage.getPublicUrl(filename);
-    logAccountEvent("corporation_logo_stored", { mode: "supabase", bytes: normalized.length, mime });
-    return data.publicUrl;
+    logAccountEvent("corporation_logo_stored", { mode: "s3", bytes: normalized.length, mime });
+    return publicUrl;
   }
 
-  // Local development adapter (verification harness / offline staging).
-  const dir = path.resolve(process.cwd(), CORPORATION_LOGO_LOCAL_DIR);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, filename), normalized);
-  logAccountEvent("corporation_logo_stored", { mode: "local", bytes: normalized.length, mime });
-  return `${CORPORATION_LOGO_PUBLIC_PREFIX}/${filename}`;
+  if (env.LOGO_STORAGE_MODE === "local") {
+    const filename = `${randomUUID()}.${ext}`;
+    const dir = path.resolve(process.cwd(), CORPORATION_LOGO_LOCAL_DIR);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, filename), normalized);
+    logAccountEvent("corporation_logo_stored", { mode: "local", bytes: normalized.length, mime });
+    return `${CORPORATION_LOGO_PUBLIC_PREFIX}/${filename}`;
+  }
+
+  // "url" mode — uploads are not configured; fail closed, never pretend.
+  throw new PublicAccountError(
+    "Logo uploads require object storage to be configured (LOGO_STORAGE_MODE=s3). Provide a logo URL instead.",
+    "logo_uploads_disabled",
+  );
 }
 
 /** Resolve a local-mode corporation logo filename to an absolute path (or

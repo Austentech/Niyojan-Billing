@@ -32,11 +32,32 @@ export const adminEmailSchema = z
   .max(CORPORATION_POLICY.emailMaxLength, `Email must be at most ${CORPORATION_POLICY.emailMaxLength} characters.`)
   .refine((value) => z.email().safeParse(value).success, "Enter a valid email address.");
 
+/** Optional logo URL: empty/whitespace -> undefined; must be http(s). */
+const optionalLogoUrl = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.optional(
+    z
+      .string()
+      .trim()
+      .max(2048, "Logo URL must be at most 2048 characters.")
+      .refine((value) => {
+        try {
+          const url = new URL(value);
+          return url.protocol === "http:" || url.protocol === "https:";
+        } catch {
+          return false;
+        }
+      }, "Enter a valid logo URL starting with http:// or https://."),
+  ),
+);
+
 /** Corporation profile form (client + server). */
 export const corporationProfileSchema = z.object({
   corporationName: corporationNameSchema,
   displayName: displayNameSchema,
   email: adminEmailSchema,
+  /** Logo URL — used when the upload control is not offered (no object storage). */
+  logoUrl: optionalLogoUrl,
 });
 
 export type CorporationProfileInput = z.input<typeof corporationProfileSchema>;

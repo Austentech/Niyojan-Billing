@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getSupabaseServiceClient } from "@/lib/auth/server/db";
+import { getSql } from "@/lib/db";
 import { isServerEnvConfigured } from "@/lib/config/env";
 
 /**
@@ -16,10 +16,7 @@ export async function GET() {
   try {
     // Lightweight authenticated probe: the lockout-state function touches the
     // security tables without exposing any value.
-    const { error } = await getSupabaseServiceClient().rpc("auth_lockout_state");
-    if (error) {
-      return NextResponse.json({ status: "degraded", database: "unreachable" }, { status: 503 });
-    }
+    await getSql()`select auth_lockout_state()`;
     return NextResponse.json({ status: "ok", database: "reachable" });
   } catch {
     return NextResponse.json({ status: "degraded", database: "unreachable" }, { status: 503 });

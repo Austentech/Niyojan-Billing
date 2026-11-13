@@ -8,6 +8,7 @@ import { PageHeader, EmptyState } from "@/components/common/ui-blocks";
 import { AddFirmDialog } from "@/components/firms/add-firm-dialog";
 import { FirmList } from "@/components/firms/firm-list";
 import { getSessionContext } from "@/lib/auth/server/context";
+import { getServerEnv, isLogoUploadEnabled } from "@/lib/config/env";
 import { listFirms } from "@/lib/firms/service";
 import { COOKIE_NAMES } from "@/lib/constants";
 import type { SessionContext } from "@/lib/auth/types";
@@ -44,6 +45,13 @@ export default async function FirmManagementPage({
   const params = await searchParams;
   const autoOpen = params.new === "1";
   const csrfToken = (await cookies()).get(COOKIE_NAMES.csrf)?.value ?? "";
+  const logoUploadEnabled = (() => {
+    try {
+      return isLogoUploadEnabled(getServerEnv());
+    } catch {
+      return false;
+    }
+  })();
 
   let firms: FirmView[] = [];
   let loadFailed = false;
@@ -60,7 +68,7 @@ export default async function FirmManagementPage({
         description="Add and manage the business entities operating under Niyojan Corporation."
         actions={
           firms.length > 0 && !loadFailed ? (
-            <AddFirmDialog csrfToken={csrfToken} />
+            <AddFirmDialog csrfToken={csrfToken} logoUploadEnabled={logoUploadEnabled} />
           ) : null
         }
       />
@@ -81,7 +89,7 @@ export default async function FirmManagementPage({
           icon={Building2}
           title="No firms added yet."
           description="Start building your centralized business workspace by adding your first firm."
-          action={<AddFirmDialog csrfToken={csrfToken} autoOpen={autoOpen} trigger="empty" />}
+          action={<AddFirmDialog csrfToken={csrfToken} logoUploadEnabled={logoUploadEnabled} autoOpen={autoOpen} trigger="empty" />}
           className="mt-6"
         />
       ) : (

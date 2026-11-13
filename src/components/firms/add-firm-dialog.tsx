@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -34,54 +34,54 @@ import type { FirmActionState } from "@/types/firms";
  * Add New Firm — professional modal form.
  *
  *   * Client-side Zod mirrors the authoritative server validation (UX only).
- *   * The optional logo is checked immediately (type + size) and re-verified
- *     on the server from the actual bytes.
+ *   * Logo handling adapts to the storage configuration: when object storage
+ *     is configured (LOGO_STORAGE_MODE=s3 / local harness) the upload control
+ *     offers a hardened file upload; otherwise a validated logo URL field is
+ *     offered instead — never a dead button.
  *   * On success: feedback, the form closes, and both the dashboard and the
  *     firm-management list revalidate (server re-render) — the new firm is
  *     immediately visible everywhere.
  */
 export function AddFirmDialog({
   csrfToken,
+  logoUploadEnabled = false,
   autoOpen = false,
   trigger = "header",
 }: {
   csrfToken: string;
+  /** True only when LOGO_STORAGE_MODE is s3 (or the local dev harness). */
+  logoUploadEnabled?: boolean;
   autoOpen?: boolean;
   trigger?: "header" | "empty";
 }) {
   const router = useRouter();
-  const [open, setOpen] = useState(false);
+  // Opens once when mounted with ?new=1 (dashboard empty-state CTA).
+  const [open, setOpen] = useState(autoOpen);
   const [submitting, setSubmitting] = useState(false);
   const [serverState, setServerState] = useState<FirmActionState>({ status: "idle" });
   const [logoFile, setLogoFile] = useState<File | null>(null);
-  const [logoPreviewUrl, setLogoPreviewUrl] = useState<string | null>(null);
   const [logoError, setLogoError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const form = useForm<FirmFormInput, unknown, ReturnType<typeof firmFormSchema.parse>>({
     resolver: zodResolver(firmFormSchema),
-    defaultValues: { firmName: "", websiteUrl: "", holdingPercentage: "", address: "", description: "" },
+    defaultValues: { firmName: "", websiteUrl: "", logoUrl: "", holdingPercentage: "", address: "", description: "" },
   });
 
-  /* Auto-open via /settings/firms?new=1 (dashboard empty-state CTA), then
-     strip the parameter so a refresh does not reopen the modal. */
+  /* Strip the ?new=1 parameter so a refresh does not reopen the modal. */
   useEffect(() => {
     if (autoOpen) {
-      setOpen(true);
       router.replace("/settings/firms");
     }
   }, [autoOpen, router]);
 
-  /* Blob preview lifecycle. */
+  /* Blob preview lifecycle — derived, with cleanup of the last URL. */
+  const logoPreviewUrl = useMemo(() => (logoFile ? URL.createObjectURL(logoFile) : null), [logoFile]);
   useEffect(() => {
-    if (!logoFile) {
-      setLogoPreviewUrl(null);
-      return;
-    }
-    const url = URL.createObjectURL(logoFile);
-    setLogoPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [logoFile]);
+    return () => {
+      if (logoPreviewUrl) URL.revokeObjectURL(logoPreviewUrl);
+    };
+  }, [logoPreviewUrl]);
 
   function resetAll() {
     form.reset();
@@ -122,10 +122,11 @@ export function AddFirmDialog({
       formData.set("csrf", csrfToken);
       formData.set("firmName", values.firmName);
       formData.set("websiteUrl", values.websiteUrl ?? "");
+      formData.set("logoUrl", values.logoUrl ?? "");
       formData.set("holdingPercentage", String(values.holdingPercentage));
       formData.set("address", values.address);
       formData.set("description", values.description ?? "");
-      if (logoFile) formData.set("logo", logoFile);
+      if (logoFile && logoUploadEnabled) formData.set("logo", logoFile);
 
       const result = await createFirmAction({ status: "idle" }, formData);
       setServerState(result);
@@ -201,7 +202,12 @@ export function AddFirmDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4" noValidate>
+        <form
+          // eslint-disable-next-line react-hooks/refs -- React Hook Form's documented submit interop
+          onSubmit={form.handleSubmit(onSubmit)}
+          className="space-y-4"
+          noValidate
+        >
           <div aria-live="polite">
             {serverState.status === "blocked" ||
             serverState.status === "unavailable" ||
@@ -342,7 +348,8 @@ export function AddFirmDialog({
             )}
           </div>
 
-          {/* Firm logo — optional image upload */}
+          {/* Firm logo — hardened upload (object storage) or validated URL */}
+          {logoUploadEnabled ? (
           <div className="space-y-1.5">
             <Label htmlFor="firmLogoFile">Firm logo</Label>
             <div className="flex items-center gap-4">
@@ -411,6 +418,30 @@ export function AddFirmDialog({
               </p>
             ) : null}
           </div>
+          ) : (
+          <div className="space-y-1.5">
+            <Label htmlFor="firmLogoUrl">Firm logo URL</Label>
+            <Input
+              id="firmLogoUrl"
+              type="text"
+              inputMode="url"
+              placeholder="https://cdn.example.com/firm-logo.png"
+              aria-invalid={Boolean(errors.logoUrl)}
+              aria-describedby={errors.logoUrl ? "firmLogoUrl-error" : "firmLogoUrl-hint"}
+              className="h-10"
+              {...form.register("logoUrl")}
+            />
+            {errors.logoUrl ? (
+              <p id="firmLogoUrl-error" className="text-[13px] font-medium text-destructive">
+                {errors.logoUrl.message}
+              </p>
+            ) : (
+              <p id="firmLogoUrl-hint" className="text-[12px] text-muted-foreground">
+                Optional — a hosted PNG, JPG or WebP image (http:// or https://).
+              </p>
+            )}
+          </div>
+          )}
 
           <DialogFooter className="gap-2 pt-2">
             <Button

@@ -148,8 +148,9 @@ export const EMAIL_CHANGE_POLICY = {
 } as const;
 
 /**
- * Local (development) logo directories for LOGO_STORAGE_MODE=local.
- * Served ONLY through the sanitized /uploads/[...path] route handler.
+ * Local (development/harness) logo directories for LOGO_STORAGE_MODE=local.
+ * Served ONLY through the sanitized /uploads/[...path] route handler and
+ * hard-disabled in production.
  */
 export const FIRM_LOGO_LOCAL_DIR = ".data/firm-logos";
 export const CORPORATION_LOGO_LOCAL_DIR = ".data/corporation-logos";
@@ -158,6 +159,6 @@ export const CORPORATION_LOGO_LOCAL_DIR = ".data/corporation-logos";
 export const FIRM_LOGO_PUBLIC_PREFIX = "/uploads/firm-logos";
 export const CORPORATION_LOGO_PUBLIC_PREFIX = "/uploads/corporation-logos";
 
-/** Supabase Storage buckets dedicated to logos (production mode). */
-export const FIRM_LOGO_BUCKET = "firm-logos";
-export const CORPORATION_LOGO_BUCKET = "corporation-logos";
+/** Object-storage key prefixes (LOGO_STORAGE_MODE=s3) — separate areas. */
+export const FIRM_LOGO_S3_PREFIX = "firm-logos";
+export const CORPORATION_LOGO_S3_PREFIX = "corporation-logos";

@@ -35,33 +35,22 @@ function generateCsrfToken(): string {
 }
 
 /**
- * The project's Supabase origin — the only cross-origin image source allowed
- * (firm logos are served from public Supabase Storage URLs in production).
- * Read from NEXT_PUBLIC_SUPABASE_URL, which is safe to reference here.
+ * Logos may be served from the configured object-storage provider or from
+ * validated http(s) logo URLs — images carry no script-execution risk.
  */
-function supabaseImageOrigin(): string {
-  try {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-    return url ? new URL(url).origin : "";
-  } catch {
-    return "";
-  }
-}
-
 function buildContentSecurityPolicy(nonce: string): string {
   const scriptSrc = isProduction
     ? `'self' 'nonce-${nonce}' 'strict-dynamic'`
     : `'self' 'unsafe-eval' 'unsafe-inline'`;
-  const supabaseOrigin = supabaseImageOrigin();
-  const imgSrc = ["'self'", "data:", "blob:", ...(supabaseOrigin ? [supabaseOrigin] : [])].join(" ");
   return [
     "default-src 'self'",
     `script-src ${scriptSrc}`,
     // Tailwind + Next.js inject critical inline styles.
     "style-src 'self' 'unsafe-inline'",
-    `img-src ${imgSrc}`,
+    "img-src 'self' data: blob: https: http:",
     "font-src 'self' data:",
-    // The browser never talks to Supabase — every query is server-side.
+    // The browser never talks to the database or object storage — every
+    // query and upload is server-side.
     "connect-src 'self'",
     "object-src 'none'",
     "base-uri 'self'",

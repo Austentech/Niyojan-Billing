@@ -64,6 +64,7 @@ export function CorporationProfileCard({
   displayName,
   currentEmail,
   initialPendingEmail,
+  logoUploadEnabled = false,
 }: {
   csrfToken: string;
   corporationName: string;
@@ -71,6 +72,8 @@ export function CorporationProfileCard({
   displayName: string;
   currentEmail: string;
   initialPendingEmail: PendingEmail | null;
+  /** True only when LOGO_STORAGE_MODE is s3 (or the local dev harness). */
+  logoUploadEnabled?: boolean;
 }) {
   const router = useRouter();
 
@@ -93,6 +96,7 @@ export function CorporationProfileCard({
           logoUrl={logoUrl}
           displayName={displayName}
           currentEmail={currentEmail}
+          logoUploadEnabled={logoUploadEnabled}
         />
 
         <Separator className="my-6" />
@@ -118,12 +122,14 @@ function ProfileForm({
   logoUrl,
   displayName,
   currentEmail,
+  logoUploadEnabled = false,
 }: {
   csrfToken: string;
   corporationName: string;
   logoUrl: string | null;
   displayName: string;
   currentEmail: string;
+  logoUploadEnabled?: boolean;
 }) {
   const router = useRouter();
   const [serverState, setServerState] = useState<ProfileActionState>({ status: "idle" });
@@ -137,15 +143,21 @@ function ProfileForm({
 
   const form = useForm<CorporationProfileInput>({
     resolver: zodResolver(corporationProfileSchema),
-    defaultValues: { corporationName, displayName, email: currentEmail },
+    defaultValues: { corporationName, displayName, email: currentEmail, logoUrl: logoUrl ?? "" },
   });
 
   // Keep the form in sync with fresh server values after revalidation. The
   // email field is carried for schema validation only (the current email —
   // changes go through the dedicated verification section below).
   useEffect(() => {
-    form.reset({ corporationName, displayName, email: currentEmail });
-  }, [form, corporationName, displayName, currentEmail]);
+    form.reset({ corporationName, displayName, email: currentEmail, logoUrl: logoUrl ?? "" });
+  }, [form, corporationName, displayName, currentEmail, logoUrl]);
+
+  // A newly typed logo URL cancels any "restore official logo" intent.
+  const watchedLogoUrl = form.watch("logoUrl") as string | undefined;
+  useEffect(() => {
+    if (typeof watchedLogoUrl === "string" && watchedLogoUrl.trim() !== "") setRemoveLogo(false);
+  }, [watchedLogoUrl]);
 
   // Reset the "remove logo" intent whenever a new file is chosen.
   useEffect(() => {
@@ -196,7 +208,8 @@ function ProfileForm({
       formData.set("corporationName", values.corporationName);
       formData.set("displayName", values.displayName);
       formData.set("email", values.email ?? "");
-      if (logoFile) formData.set("logo", logoFile);
+      formData.set("logoUrl", typeof values.logoUrl === "string" ? values.logoUrl : "");
+      if (logoFile && logoUploadEnabled) formData.set("logo", logoFile);
       if (removeLogo) formData.set("removeLogo", "true");
 
       const result = await updateCorporationProfileAction({ status: "idle" }, formData);
@@ -234,6 +247,7 @@ function ProfileForm({
 
   const nameError = form.formState.errors.corporationName?.message;
   const displayNameError = form.formState.errors.displayName?.message;
+  const logoUrlFieldError = form.formState.errors.logoUrl?.message;
 
   const shownLogo = logoPreviewUrl ?? (removeLogo ? null : logoUrl);
 
@@ -253,7 +267,8 @@ function ProfileForm({
         ) : null}
       </div>
 
-      {/* Corporation logo — upload / replace / restore default */}
+      {/* Corporation logo — hardened upload (object storage) or validated URL */}
+      {logoUploadEnabled ? (
       <div className="space-y-1.5">
         <Label htmlFor="corporationLogoFile">Corporation logo</Label>
         <div className="flex items-center gap-4">
@@ -348,6 +363,68 @@ function ProfileForm({
           </p>
         ) : null}
       </div>
+      ) : (
+      <div className="space-y-1.5">
+        <Label htmlFor="corporationLogoUrl">Corporation logo URL</Label>
+        <div className="flex items-center gap-4">
+          <span
+            className="flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-md border bg-secondary/60"
+            aria-hidden="true"
+          >
+            {shownLogo ? (
+              <img src={shownLogo} alt="" className="h-full w-full object-contain p-1.5" />
+            ) : (
+              <Building2 className="size-6 text-muted-foreground" />
+            )}
+          </span>
+          <div className="min-w-0 flex-1">
+            <Input
+              id="corporationLogoUrl"
+              type="text"
+              inputMode="url"
+              placeholder="https://cdn.example.com/corporation-logo.png"
+              aria-invalid={Boolean(logoUrlFieldError)}
+              aria-describedby={logoUrlFieldError ? "corporationLogoUrl-error" : "corporationLogoUrl-hint"}
+              className="h-10"
+              {...form.register("logoUrl")}
+            />
+            {logoUrlFieldError ? (
+              <p id="corporationLogoUrl-error" className="mt-1 text-[13px] font-medium text-destructive">
+                {logoUrlFieldError}
+              </p>
+            ) : null}
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {logoUrl && !removeLogo ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-muted-foreground"
+                  onClick={() => {
+                    setRemoveLogo(true);
+                    setServerState({ status: "idle" });
+                    form.setValue("logoUrl", "");
+                  }}
+                >
+                  <RefreshCw className="size-3.5" aria-hidden="true" />
+                  Restore official logo
+                </Button>
+              ) : null}
+            </div>
+            <p id="corporationLogoUrl-hint" className="mt-1.5 text-[12px] text-muted-foreground">
+              {logoUrl
+                ? "A custom logo URL is active. Leave empty to keep it, or use Restore official logo."
+                : "Official brand logo in use. Set a hosted PNG, JPG or WebP URL (http:// or https://) to customize."}
+            </p>
+          </div>
+        </div>
+        {logoError ? (
+          <p role="alert" className="text-[13px] font-medium text-destructive">
+            {logoError}
+          </p>
+        ) : null}
+      </div>
+      )}
 
       {/* Corporation name */}
       <div className="space-y-1.5">
@@ -439,9 +516,11 @@ function EmailChangeSection({
   const cooldownSeconds = useCountdown(cooldownTarget || null);
   const expiresInSeconds = useCountdown(pending?.expiresAt ?? null);
 
+  /* eslint-disable react-hooks/set-state-in-effect -- re-syncs the pending request once per revalidated prop set (router.refresh delivers new props) */
   useEffect(() => {
     if (initialPendingEmail) setPending(initialPendingEmail);
   }, [initialPendingEmail]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   async function handleRequest(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();

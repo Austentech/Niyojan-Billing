@@ -1,18 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { NextResponse } from "next/server";
 
+import { getServerEnv } from "@/lib/config/env";
 import { localFirmLogoPath, localLogoContentType } from "@/lib/firms/storage";
 import { localCorporationLogoPath, localCorporationLogoContentType } from "@/lib/account/storage";
 
 /**
- * Local-development logo serving (LOGO_STORAGE_MODE=local only).
+ * Local-development logo serving (LOGO_STORAGE_MODE=local ONLY).
  *
- * Production serves logos straight from public Supabase Storage URLs; this
- * route exists so the verification harness (which has no Storage API) can
- * exercise the exact same upload/display flow locally for BOTH firm logos
- * and the corporation logo.
+ * Production serves logos straight from the object-storage provider's public
+ * URLs (or validated external URLs); this route exists so the verification
+ * harness (which has no Storage API) can exercise the exact same
+ * upload/display flow locally for BOTH firm logos and the corporation logo.
  *
  * SECURITY
+ *   * Hard-refuses to serve anything outside local development mode.
  *   * The path is validated against strict UUID+extension patterns — no
  *     user-controlled characters, path traversal is impossible.
  *   * Content-Type is derived from the whitelisted extension only.
@@ -43,6 +45,16 @@ export async function GET(
   _request: Request,
   { params }: { params: Promise<{ path: string[] }> },
 ) {
+  // Fail closed outside the development adapter — serverless filesystems are
+  // ephemeral and MUST NOT serve persisted data in production.
+  try {
+    if (getServerEnv().LOGO_STORAGE_MODE !== "local" || process.env.NODE_ENV === "production") {
+      return new NextResponse("Not Found", { status: 404 });
+    }
+  } catch {
+    return new NextResponse("Not Found", { status: 404 });
+  }
+
   const segments = (await params).path ?? [];
 
   // Exactly /uploads/<area>/<filename> — nothing else is served.

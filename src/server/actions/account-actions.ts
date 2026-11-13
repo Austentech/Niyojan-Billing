@@ -132,6 +132,7 @@ export async function updateCorporationProfileAction(
       corporationName: String(formData.get("corporationName") ?? ""),
       displayName: String(formData.get("displayName") ?? ""),
       email: String(formData.get("email") ?? session.email),
+      logoUrl: String(formData.get("logoUrl") ?? ""),
     });
     if (!parsed.success) {
       const fieldErrors: Record<string, string> = {};
@@ -142,7 +143,7 @@ export async function updateCorporationProfileAction(
       return { status: "invalid", fieldErrors };
     }
 
-    /* --- 5. Optional logo: harden + upload (before any write) ------------------- */
+    /* --- 5. Optional logo: uploaded file (object storage) or validated URL ------- */
     const logoEntry = formData.get("logo");
     const removeLogo = formData.get("removeLogo") === "true";
     let logoUrl: string | null | undefined;
@@ -151,6 +152,8 @@ export async function updateCorporationProfileAction(
       logoUrl = await storeCorporationLogo(bytes); // throws PublicAccountError on rejection
     } else if (removeLogo) {
       logoUrl = null;
+    } else if (parsed.data.logoUrl) {
+      logoUrl = parsed.data.logoUrl;
     }
 
     /* --- 6. Persist via the service layer ------------------------------------------ */

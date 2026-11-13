@@ -1,10 +1,11 @@
-import { getSupabaseServiceClient, dbSystemError } from "@/lib/auth/server/db";
+import { getSql } from "@/lib/db";
+import { dbSystemError } from "@/lib/auth/server/db";
 import { logAuthError } from "@/lib/auth/errors";
 import type { LockoutState } from "@/lib/auth/types";
 
 /**
  * GLOBAL login lockout — thin typed wrappers over the atomic SECURITY
- * DEFINER functions in supabase/migrations/0001_auth_core.sql.
+ * DEFINER functions created by migration 0000 (drizzle/0000_niyojan_core.sql).
  *
  * The state lives in PostgreSQL (single 'GLOBAL' row), so the lockout:
  *   * applies to every device, browser and IP address,
@@ -43,13 +44,15 @@ function toLockoutState(raw: RawLockoutJson | null): LockoutState {
 
 /** Current GLOBAL lockout state. Throws SystemAuthError when the database is unreachable. */
 export async function getLockoutState(): Promise<LockoutState> {
-  const { data, error } = await getSupabaseServiceClient().rpc("auth_lockout_state");
-  if (error) {
-    const sysErr = dbSystemError("auth_lockout_state", error);
+  try {
+    const sql = getSql();
+    const rows = await sql<{ result: RawLockoutJson }[]>`select auth_lockout_state() as result`;
+    return toLockoutState(rows[0]?.result ?? {});
+  } catch (err) {
+    const sysErr = dbSystemError("auth_lockout_state", err);
     logAuthError("lockout_state_unavailable", sysErr);
     throw sysErr;
   }
-  return toLockoutState((data ?? {}) as RawLockoutJson);
 }
 
 /**
@@ -67,21 +70,24 @@ export async function getLockoutStateForRender(): Promise<LockoutState> {
 
 /** Count one failed authentication attempt (atomic). Returns the new state. */
 export async function registerAuthFailure(): Promise<LockoutState & { lockoutActivated: boolean }> {
-  const { data, error } = await getSupabaseServiceClient().rpc("auth_register_failure");
-  if (error) {
-    const sysErr = dbSystemError("auth_register_failure", error);
+  try {
+    const sql = getSql();
+    const rows = await sql<{ result: RawLockoutJson }[]>`select auth_register_failure() as result`;
+    const raw = rows[0]?.result ?? {};
+    return { ...toLockoutState(raw), lockoutActivated: Boolean(raw?.lockout_activated) };
+  } catch (err) {
+    const sysErr = dbSystemError("auth_register_failure", err);
     logAuthError("register_failure_unavailable", sysErr);
     throw sysErr;
   }
-  const raw = (data ?? {}) as RawLockoutJson;
-  return { ...toLockoutState(raw), lockoutActivated: Boolean(raw?.lockout_activated) };
 }
 
 /** A complete successful authentication — resets the consecutive-failure counter. */
 export async function registerAuthSuccess(): Promise<void> {
-  const { error } = await getSupabaseServiceClient().rpc("auth_register_success");
-  if (error) {
+  try {
+    await getSql()`select auth_register_success()`;
+  } catch (err) {
     // Non-fatal: the login itself already succeeded; log for operations.
-    logAuthError("register_success_unavailable", dbSystemError("auth_register_success", error));
+    logAuthError("register_success_unavailable", dbSystemError("auth_register_success", err));
   }
 }

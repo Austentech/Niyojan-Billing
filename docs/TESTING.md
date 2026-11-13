@@ -4,10 +4,11 @@
 
 | Suite | Command | Needs database | Coverage |
 | --- | --- | --- | --- |
-| Unit | `npx tsx scripts/test-unit.ts` | No | OTP generation/hashing, normalization, Zod schemas (incl. the strong 12-char password policy), pre-auth cookie signing (tamper/expiry), Argon2id roundtrip, email masking, env validation hygiene |
-| Integration (auth) | `npx tsx scripts/test-auth.ts` | Yes (staging or local harness) | The full 13-scenario Phase 1 matrix + extras |
-| Integration (firms) | `npx tsx scripts/test-firms.ts` | Yes (staging or local harness) | The full 12-scenario Phase 2 matrix + extras |
-| Integration (account) | `npx tsx scripts/test-account.ts` | Yes (staging or local harness) | The full 12-scenario Phase 3 matrix + extras |
+| SigV4 | `bun run test:sigv4` | No | AWS Signature V4 signing core verified against the official AWS reference vectors (signing-key derivation + full-request signature) |
+| Unit | `bun run test:unit` | No | OTP generation/hashing, normalization, Zod schemas (incl. the strong 12-char password policy), pre-auth cookie signing (tamper/expiry), Argon2id roundtrip, email masking, env validation hygiene |
+| Integration (auth) | `bun run test:auth` | Yes (`bun run harness:start` or a staging PostgreSQL) | The full 13-scenario Phase 1 matrix + extras |
+| Integration (firms) | `bun run test:firms` | Yes (same) | The full 12-scenario Phase 2 matrix + extras |
+| Integration (account) | `bun run test:account` | Yes (same) | The full 12-scenario Phase 3 matrix + extras | The full 12-scenario Phase 3 matrix + extras |
 
 Run the unit suite first (it also sanity-checks the `.env` contract), then the
 integration suites.
@@ -34,7 +35,7 @@ All 13 are asserted by `scripts/test-auth.ts` (90 checks total):
 
 **Extras** (also asserted): bootstrap idempotency and never-overwrite semantics,
 atomic rate-limit windows (4th call denied with retry-after), audit trail content,
-RLS blocking the anon key (tables *and* function execution), and log hygiene
+the unprivileged database role (`niyojan_anon`, zero privileges) blocked from tables AND function execution (the plain-PostgreSQL successor to the Supabase-era RLS checks), and log hygiene
 (neither the OTP code nor the password ever appear in captured console output).
 
 ## The Phase 2 required scenarios → automated assertions

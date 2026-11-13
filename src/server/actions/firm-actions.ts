@@ -23,8 +23,9 @@ import type { FirmActionState } from "@/types/firms";
  *   2. origin + CSRF double-submit validation,
  *   3. distributed rate limiting on the write operation,
  *   4. server-authoritative field validation (Zod),
- *   5. logo hardening (magic bytes + sharp re-encode) and upload,
- *   6. parameterized insert into public.firms,
+ *   5. logo handling — uploaded file (magic-byte sniffing, sharp re-encode,
+ *      object-storage upload) or a validated http(s) URL,
+ *   6. parameterized insert into public.firms (Drizzle),
  *   7. revalidation of every surface that renders firm data.
  *
  * Errors are mapped to safe client states — no internal detail, no storage
@@ -83,6 +84,7 @@ export async function createFirmAction(_prev: FirmActionState, formData: FormDat
     const raw = {
       firmName: String(formData.get("firmName") ?? ""),
       websiteUrl: String(formData.get("websiteUrl") ?? ""),
+      logoUrl: String(formData.get("logoUrl") ?? ""),
       holdingPercentage: String(formData.get("holdingPercentage") ?? ""),
       address: String(formData.get("address") ?? ""),
       description: String(formData.get("description") ?? ""),
@@ -97,16 +99,18 @@ export async function createFirmAction(_prev: FirmActionState, formData: FormDat
       return { status: "invalid", fieldErrors };
     }
 
-    /* --- 5. Optional logo: harden + upload ------------------------------------------ */
+    /* --- 5. Optional logo: uploaded file (object storage) or validated URL ---- */
     const logoEntry = formData.get("logo");
     let logoUrl: string | null = null;
     if (logoEntry instanceof File && logoEntry.size > 0) {
       const bytes = Buffer.from(await logoEntry.arrayBuffer());
       logoUrl = await storeFirmLogo(bytes);
+    } else if (parsed.data.logoUrl) {
+      logoUrl = parsed.data.logoUrl;
     }
 
-    /* --- 6. Insert (parameterized via the service client) ------------------------------ */
-    const result = await createFirm(raw, logoUrl);
+    /* --- 6. Insert (parameterized Drizzle statement) ------------------------------ */
+    const result = await createFirm(raw, logoUrl, session.adminId);
     if (result.status === "invalid") {
       return { status: "invalid", fieldErrors: result.fieldErrors };
     }

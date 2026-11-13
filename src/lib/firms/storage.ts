@@ -3,8 +3,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { getServerEnv } from "@/lib/config/env";
-import { getSupabaseServiceClient } from "@/lib/auth/server/db";
-import { FIRM_LOGO_BUCKET, FIRM_LOGO_LOCAL_DIR, FIRM_LOGO_POLICY, FIRM_LOGO_PUBLIC_PREFIX } from "@/lib/constants";
+import { s3PutObject } from "@/lib/storage/s3";
+import { FIRM_LOGO_LOCAL_DIR, FIRM_LOGO_POLICY, FIRM_LOGO_PUBLIC_PREFIX, FIRM_LOGO_S3_PREFIX } from "@/lib/constants";
 import {
   detectImageMime as codecDetectImageMime,
   extensionForMime,
@@ -26,11 +26,15 @@ import { PublicFirmError, SystemFirmError, logFirmEvent } from "@/lib/firms/erro
  *   4. The stored filename is a server-generated UUID + whitelisted
  *      extension — no user-controlled characters ever reach a path.
  *
- * STORAGE ADAPTERS
- *   * "supabase" (default, production) — dedicated `firm-logos` bucket via
- *     the service-role client; public URLs from Supabase Storage.
- *   * "local" (development/harness) — files under .data/firm-logos, served
- *     only through the sanitized /uploads/[...path] route handler.
+ * STORAGE ADAPTERS (LOGO_STORAGE_MODE)
+ *   * "s3" (production) — S3-compatible object storage (AWS S3, Cloudflare
+ *     R2, Backblaze B2, MinIO, ...). Persistent across deployments; public
+ *     URLs served from the configured bucket.
+ *   * "local" (development/harness only) — files under .data/firm-logos,
+ *     served through the sanitized /uploads/[...path] route handler.
+ *   * "url" (default) — uploads are NOT offered in the UI; logos are set by
+ *     validated http(s) URL instead. Reaching this adapter is a bug: it
+ *     fails closed instead of pretending to store anything.
  */
 
 /** Kept for backwards compatibility with existing imports. */
@@ -77,30 +81,34 @@ export async function storeFirmLogo(rawBytes: Buffer): Promise<string> {
   }
 
   const ext = extensionForMime(mime);
-  const filename = `${randomUUID()}.${ext}`;
   const env = getServerEnv();
 
-  if (env.LOGO_STORAGE_MODE === "supabase") {
-    const storage = getSupabaseServiceClient().storage.from(FIRM_LOGO_BUCKET);
-    const { error } = await storage.upload(filename, normalized, {
-      contentType: mime,
-      upsert: false,
-      cacheControl: "31536000",
-    });
-    if (error) {
-      throw new SystemFirmError(`firm logo upload failed (${error.statusCode ?? ""})`);
+  if (env.LOGO_STORAGE_MODE === "s3") {
+    const key = `${FIRM_LOGO_S3_PREFIX}/${randomUUID()}.${ext}`;
+    let publicUrl: string;
+    try {
+      publicUrl = await s3PutObject({ key, body: normalized, contentType: mime });
+    } catch (err) {
+      throw new SystemFirmError(err instanceof Error ? err.message : "firm logo upload failed");
     }
-    const { data } = storage.getPublicUrl(filename);
-    logFirmEvent("firm_logo_stored", { mode: "supabase", bytes: normalized.length, mime });
-    return data.publicUrl;
+    logFirmEvent("firm_logo_stored", { mode: "s3", bytes: normalized.length, mime });
+    return publicUrl;
   }
 
-  // Local development adapter (verification harness / offline staging).
-  const dir = path.resolve(process.cwd(), FIRM_LOGO_LOCAL_DIR);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, filename), normalized);
-  logFirmEvent("firm_logo_stored", { mode: "local", bytes: normalized.length, mime });
-  return `${FIRM_LOGO_PUBLIC_PREFIX}/${filename}`;
+  if (env.LOGO_STORAGE_MODE === "local") {
+    const filename = `${randomUUID()}.${ext}`;
+    const dir = path.resolve(process.cwd(), FIRM_LOGO_LOCAL_DIR);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, filename), normalized);
+    logFirmEvent("firm_logo_stored", { mode: "local", bytes: normalized.length, mime });
+    return `${FIRM_LOGO_PUBLIC_PREFIX}/${filename}`;
+  }
+
+  // "url" mode — uploads are not configured; fail closed, never pretend.
+  throw new PublicFirmError(
+    "Logo uploads require object storage to be configured (LOGO_STORAGE_MODE=s3). Provide a logo URL instead.",
+    "logo_uploads_disabled",
+  );
 }
 
 /** Resolve a local-mode logo filename to an absolute path (or null when the

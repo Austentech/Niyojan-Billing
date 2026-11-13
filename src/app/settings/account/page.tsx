@@ -19,6 +19,7 @@ import { LogoMark } from "@/components/brand/brand-logo";
 import { CorporationProfileCard } from "@/components/settings/corporation-profile-card";
 import { PasswordChangeForm } from "@/components/settings/password-change-form";
 import { getSessionContext } from "@/lib/auth/server/context";
+import { getServerEnv, isLogoUploadEnabled } from "@/lib/config/env";
 import { getAccountOverview, type AccountOverview } from "@/lib/account/service";
 import { BRAND, COOKIE_NAMES } from "@/lib/constants";
 import type { SessionContext } from "@/lib/auth/types";
@@ -71,6 +72,13 @@ export default async function AccountSettingsPage() {
   }
 
   const csrfToken = (await cookies()).get(COOKIE_NAMES.csrf)?.value ?? "";
+  const logoUploadEnabled = (() => {
+    try {
+      return isLogoUploadEnabled(getServerEnv());
+    } catch {
+      return false;
+    }
+  })();
 
   let overview: AccountOverview | null = null;
   let loadFailed = false;
@@ -187,6 +195,7 @@ export default async function AccountSettingsPage() {
             logoUrl={corporation.logoUrl}
             displayName={admin.displayName}
             currentEmail={admin.email}
+            logoUploadEnabled={logoUploadEnabled}
             initialPendingEmail={
               overview.pendingEmailChange
                 ? {

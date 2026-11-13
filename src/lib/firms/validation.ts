@@ -54,6 +54,25 @@ const holdingPercentage = z
     `Holding percentage must be between ${FIRM_POLICY.holdingMin} and ${FIRM_POLICY.holdingMax}.`,
   );
 
+/** Optional logo URL: empty/whitespace -> undefined; must be http(s) and within the stored-URL length limit. */
+const optionalLogoUrl = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.optional(
+    z
+      .string()
+      .trim()
+      .max(FIRM_POLICY.websiteUrlMaxLength, `Logo URL must be at most ${FIRM_POLICY.websiteUrlMaxLength} characters.`)
+      .refine((value) => {
+        try {
+          const url = new URL(value);
+          return url.protocol === "http:" || url.protocol === "https:";
+        } catch {
+          return false;
+        }
+      }, "Enter a valid logo URL starting with http:// or https://."),
+  ),
+);
+
 export const firmFormSchema = z.object({
   /** Required firm name. */
   firmName: z
@@ -63,6 +82,8 @@ export const firmFormSchema = z.object({
     .max(FIRM_POLICY.nameMaxLength, `Firm name must be at most ${FIRM_POLICY.nameMaxLength} characters.`),
   /** Optional website URL (http/https only). */
   websiteUrl: optionalHttpUrl,
+  /** Optional logo URL (used when object storage is not configured). */
+  logoUrl: optionalLogoUrl,
   /** Required holding percentage, 0–100, up to 2 decimals. */
   holdingPercentage,
   /** Required address. */

@@ -5,7 +5,7 @@
 import { loadDotEnv } from "./load-env";
 import { check, checkEqual, section, finish } from "./test-harness";
 
-loadDotEnv(".env");
+loadDotEnv(".env", { override: true });
 
 import { generateOtpCode, hashOtpCode, constantTimeEqualsHex } from "../src/lib/auth/server/otp";
 import { signPreauthPayload, verifyPreauthPayload } from "../src/lib/auth/server/session";

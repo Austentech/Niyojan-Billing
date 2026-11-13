@@ -16,7 +16,7 @@ interface ChildProcessModule {
 
 export async function registerNodejs(): Promise<void> {
   if (process.env.NODE_ENV === "production") return;
-  if (!process.env.NEXT_PUBLIC_SUPABASE_URL?.includes("127.0.0.1:5435")) return;
+  if (!process.env.DATABASE_URL?.includes("127.0.0.1:5433")) return;
 
   try {
     const proc = process as typeof process & {

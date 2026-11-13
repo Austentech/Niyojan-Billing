@@ -3,79 +3,89 @@ import { z } from "zod";
 import { PASSWORD_POLICY } from "@/lib/constants";
 
 /**
- * Server-side environment contract (Phase 1 authentication, Phase 2 firm
- * management, Phase 3 account settings).
+ * Server-side environment contract (PostgreSQL + Drizzle architecture).
  *
  * Validated lazily (never at import/build time) so `next build` succeeds
  * without credentials. Validation failures list VARIABLE NAMES ONLY — values
  * are never included in error output.
  *
  * This module must never be imported from a client component: it parses
- * server secrets (SUPABASE_SERVICE_ROLE_KEY, SMTP_PASSWORD, OTP_SECRET...).
+ * server secrets (DATABASE_URL, SMTP_PASSWORD, S3 keys, OTP_SECRET...).
  */
 
-const storageModeSchema = z.enum(["supabase", "local"]);
+const storageModeSchema = z.enum(["url", "s3", "local"]);
 
-const envSchema = z
-  .object({
-    // --- Initial administrator (bootstrap only) --------------------------------
-    ADMIN_NAME: z.string().trim().min(1).max(120),
-    ADMIN_USERNAME: z
-      .string()
-      .trim()
-      .toLowerCase()
-      .min(3)
-      .max(64)
-      .regex(/^[a-z0-9._-]+$/, "lowercase letters, digits, dot, underscore, hyphen"),
-    // The bootstrap password must satisfy the same strong policy as Account
-    // Settings password changes: 12+ chars, mixed case, digit, symbol.
-    ADMIN_PASSWORD: z
-      .string()
-      .min(PASSWORD_POLICY.minLength, "minimum 12 characters")
-      .max(PASSWORD_POLICY.maxLength)
-      .regex(/[a-z]/, "one lowercase letter")
-      .regex(/[A-Z]/, "one uppercase letter")
-      .regex(/[0-9]/, "one digit")
-      .regex(/[^A-Za-z0-9]/, "one symbol"),
-    ADMIN_EMAIL: z.email().max(254),
+/** postgres:// or postgresql:// connection string (optionally URL-encoded). */
+const postgresUrl = z
+  .url()
+  .refine(
+    (value) => value.startsWith("postgres://") || value.startsWith("postgresql://"),
+    "must be a postgres:// or postgresql:// connection string",
+  );
 
-    // --- Supabase ---------------------------------------------------------------
-    NEXT_PUBLIC_SUPABASE_URL: z.url(),
-    NEXT_PUBLIC_SUPABASE_ANON_KEY: z.string().min(20),
-    SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
+const envSchema = z.object({
+  // --- Initial administrator (bootstrap only) --------------------------------
+  ADMIN_NAME: z.string().trim().min(1).max(120),
+  ADMIN_USERNAME: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .min(3)
+    .max(64)
+    .regex(/^[a-z0-9._-]+$/, "lowercase letters, digits, dot, underscore, hyphen"),
+  // The bootstrap password must satisfy the same strong policy as Account
+  // Settings password changes: 12+ chars, mixed case, digit, symbol.
+  ADMIN_PASSWORD: z
+    .string()
+    .min(PASSWORD_POLICY.minLength, "minimum 12 characters")
+    .max(PASSWORD_POLICY.maxLength)
+    .regex(/[a-z]/, "one lowercase letter")
+    .regex(/[A-Z]/, "one uppercase letter")
+    .regex(/[0-9]/, "one digit")
+    .regex(/[^A-Za-z0-9]/, "one symbol"),
+  ADMIN_EMAIL: z.email().max(254),
 
-    // --- SMTP --------------------------------------------------------------------
-    SMTP_HOST: z.string().trim().min(1).max(253),
-    SMTP_PORT: z.coerce.number().int().min(1).max(65535),
-    SMTP_SECURE: z.enum(["true", "false"]).default("false"),
-    SMTP_USER: z.string().max(254).default(""),
-    SMTP_PASSWORD: z.string().max(512).default(""),
-    SMTP_FROM: z.email().max(254),
-    SMTP_DEV_CAPTURE: z.enum(["true", "false"]).default("false"),
-    SMTP_DEV_OUTBOX: z.string().max(512).default(".dev-outbox"),
+  // --- PostgreSQL (Neon / Lakebase / any standard PostgreSQL) ------------------
+  DATABASE_URL: postgresUrl,
+  /** Optional unpooled/administrative connection (migrations). */
+  DATABASE_URL_UNPOOLED: postgresUrl.optional(),
 
-    // --- Logo storage (Phases 2 & 3) ----------------------------------------------
-    // "supabase" (default) — dedicated Supabase Storage buckets (firm-logos,
-    //   corporation-logos) written by the service-role client.
-    // "local" — development/staging adapter that stores files on disk and
-    //   serves them through the /uploads route (used by the verification
-    //   harness, which has no Storage API). NEVER set "local" in production.
-    // LOGO_STORAGE_MODE is canonical; FIRM_LOGO_STORAGE_MODE is a legacy
-    // Phase 2 alias that still takes effect when only it is set.
-    LOGO_STORAGE_MODE: storageModeSchema.optional(),
-    FIRM_LOGO_STORAGE_MODE: storageModeSchema.optional(),
+  // --- SMTP --------------------------------------------------------------------
+  SMTP_HOST: z.string().trim().min(1).max(253),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535),
+  SMTP_SECURE: z.enum(["true", "false"]).default("false"),
+  SMTP_USER: z.string().max(254).default(""),
+  SMTP_PASSWORD: z.string().max(512).default(""),
+  SMTP_FROM: z.email().max(254),
+  SMTP_DEV_CAPTURE: z.enum(["true", "false"]).default("false"),
+  SMTP_DEV_OUTBOX: z.string().max(512).default(".dev-outbox"),
 
-    // --- Secrets -------------------------------------------------------------------
-    AUTH_SESSION_SECRET: z.string().min(32).max(512),
-    OTP_SECRET: z.string().min(32).max(512),
+  // --- Logo storage ---------------------------------------------------------------
+  // "url" (default) — no object storage configured: logos are entered as
+  //   validated http(s) URLs (or the bundled static asset is kept). Upload
+  //   controls are hidden rather than pretending to work.
+  // "s3" — persistent uploads to an S3-compatible object store (AWS S3,
+  //   Cloudflare R2, Backblaze B2, MinIO, ...). Requires the S3_* group.
+  // "local" — DEVELOPMENT/verification-harness adapter (filesystem + the
+  //   sanitized /uploads route). NEVER allowed in production.
+  LOGO_STORAGE_MODE: storageModeSchema.default("url"),
 
-    // --- Application -----------------------------------------------------------------
-    APP_URL: z.url(),
-  })
-  .transform((raw) => ({
-    ...raw,
-    LOGO_STORAGE_MODE: raw.LOGO_STORAGE_MODE ?? raw.FIRM_LOGO_STORAGE_MODE ?? ("supabase" as const),
-  }));
+  // --- S3-compatible object storage (required when LOGO_STORAGE_MODE=s3) --------
+  S3_ENDPOINT: z.url().max(512).optional(),
+  S3_REGION: z.string().trim().min(1).max(64).optional(),
+  S3_BUCKET: z.string().trim().min(1).max(128).optional(),
+  S3_ACCESS_KEY_ID: z.string().trim().min(1).max(256).optional(),
+  S3_SECRET_ACCESS_KEY: z.string().min(1).max(256).optional(),
+  /** Public base for logo URLs; defaults to the provider's bucket URL. */
+  S3_PUBLIC_BASE_URL: z.url().max(512).optional(),
+
+  // --- Secrets -------------------------------------------------------------------
+  AUTH_SESSION_SECRET: z.string().min(32).max(512),
+  OTP_SECRET: z.string().min(32).max(512),
+
+  // --- Application -----------------------------------------------------------------
+  APP_URL: z.url(),
+});
 
 export type ServerEnv = z.infer<typeof envSchema>;
 
@@ -93,6 +103,24 @@ export class EnvConfigError extends Error {
   }
 }
 
+/** Cross-field rules the flat schema cannot express. */
+function validateCrossField(env: z.infer<typeof envSchema>): readonly string[] {
+  const problems: string[] = [];
+  if (env.AUTH_SESSION_SECRET === env.OTP_SECRET) {
+    problems.push("AUTH_SESSION_SECRET", "OTP_SECRET (must differ)");
+  }
+  if (env.LOGO_STORAGE_MODE === "s3") {
+    const required = ["S3_REGION", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"] as const;
+    for (const name of required) {
+      if (!env[name]) problems.push(name);
+    }
+  }
+  if (env.LOGO_STORAGE_MODE === "local" && process.env.NODE_ENV === "production") {
+    problems.push("LOGO_STORAGE_MODE (local is development-only)");
+  }
+  return problems;
+}
+
 /**
  * Pure validation (exported for unit tests): parses a raw record against the
  * environment contract. Throws EnvConfigError listing variable NAMES only.
@@ -103,8 +131,9 @@ export function parseEnv(raw: Record<string, string | undefined>): ServerEnv {
     const invalidVars = parsed.error.issues.map((issue) => issue.path.join(".")).filter(Boolean);
     throw new EnvConfigError(invalidVars.length > 0 ? invalidVars : ["(unknown)"]);
   }
-  if (parsed.data.AUTH_SESSION_SECRET === parsed.data.OTP_SECRET) {
-    throw new EnvConfigError(["AUTH_SESSION_SECRET", "OTP_SECRET (must differ)"]);
+  const crossField = validateCrossField(parsed.data);
+  if (crossField.length > 0) {
+    throw new EnvConfigError(crossField);
   }
   return parsed.data;
 }
@@ -121,7 +150,7 @@ let cachedInputs = "";
  * env files in dev without resetting module caches).
  */
 export function getServerEnv(): ServerEnv {
-  const inputs = `${process.env.NEXT_PUBLIC_SUPABASE_URL ?? ""}|${process.env.SUPABASE_SERVICE_ROLE_KEY ?? ""}|${process.env.SMTP_HOST ?? ""}`;
+  const inputs = `${process.env.DATABASE_URL ?? ""}|${process.env.SMTP_HOST ?? ""}`;
   if (cached && cachedInputs === inputs) return cached;
   cached = parseEnv(process.env);
   cachedInputs = inputs;
@@ -141,4 +170,9 @@ export function isServerEnvConfigured(): boolean {
 /** Development-only mail capture must never activate in production. */
 export function isDevMailCaptureEnabled(env: ServerEnv): boolean {
   return env.SMTP_DEV_CAPTURE === "true" && process.env.NODE_ENV !== "production";
+}
+
+/** Whether logo UPLOADS are backed by persistent object storage. */
+export function isLogoUploadEnabled(env: ServerEnv): boolean {
+  return env.LOGO_STORAGE_MODE === "s3" || env.LOGO_STORAGE_MODE === "local";
 }

@@ -4,9 +4,12 @@ import path from "node:path";
 /**
  * Minimal .env loader for test scripts (no external dependency).
  * Mirrors the common dotenv semantics: KEY=VALUE lines, # comments,
- * values already present in the environment are NOT overridden.
+ * values already present in the environment are NOT overridden — unless
+ * `override` is set (tests treat .env as the single source of truth and
+ * must win over stale shell variables such as a leftover Prisma
+ * DATABASE_URL=file:... value).
  */
-export function loadDotEnv(relativePath = ".env"): void {
+export function loadDotEnv(relativePath = ".env", options: { override?: boolean } = {}): void {
   const file = path.resolve(process.cwd(), relativePath);
   let content: string;
   try {
@@ -28,7 +31,7 @@ export function loadDotEnv(relativePath = ".env"): void {
     ) {
       value = value.slice(1, -1);
     }
-    if (!(key in process.env)) {
+    if (options.override || !(key in process.env)) {
       process.env[key] = value;
     }
   }

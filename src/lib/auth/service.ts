@@ -1,18 +1,20 @@
-import { z } from "zod";
+import { desc, eq, sql } from "drizzle-orm";
 
+import { getDb, getSql, toIso } from "@/lib/db";
+import { adminAccounts, authOtpChallenges } from "@/lib/db/schema";
 import { getServerEnv } from "@/lib/config/env";
-import { getSupabaseServiceClient } from "@/lib/auth/server/db";
+import { dbSystemError } from "@/lib/auth/server/db";
 import { dummyVerify, verifyPassword } from "@/lib/auth/server/password";
 import { generateOtpCode, hashOtpCode } from "@/lib/auth/server/otp";
 import { getLockoutState, registerAuthFailure, registerAuthSuccess } from "@/lib/auth/server/lockout";
 import { enforceRateLimit } from "@/lib/auth/server/rate-limit";
 import { sendOtpEmail } from "@/lib/auth/server/email";
-import { logAuthAttempt } from "@/lib/auth/server/audit";
+import { logAuthAttempt, logSecurityEvent } from "@/lib/auth/server/audit";
 import { ensureAdminBootstrapped } from "@/lib/auth/server/bootstrap";
 import { PublicAuthError, SystemAuthError, logAuthEvent } from "@/lib/auth/errors";
 import { loginSchema, otpSchema } from "@/lib/auth/validation";
 import { maskEmail, type AdminAccountRow, type AuthAttemptMeta, type IssuedOtp, type LockoutState, type OtpConsumeStatus } from "@/lib/auth/types";
-import { LOCKOUT_FAILURE_THRESHOLD, OTP_ISSUE_HOURLY_LIMIT, OTP_MAX_ATTEMPTS, OTP_RESEND_COOLDOWN_SECONDS, OTP_TTL_SECONDS, RATE_LIMITS } from "@/lib/constants";
+import { LOCKOUT_FAILURE_THRESHOLD, OTP_ISSUE_HOURLY_LIMIT, OTP_MAX_ATTEMPTS, OTP_RESEND_COOLDOWN_SECONDS, OTP_TTL_SECONDS } from "@/lib/constants";
 
 /**
  * Authentication flow engine (framework-independent — every function takes
@@ -31,52 +33,71 @@ import { LOCKOUT_FAILURE_THRESHOLD, OTP_ISSUE_HOURLY_LIMIT, OTP_MAX_ATTEMPTS, OT
 
 /* --- Internal helpers -------------------------------------------------------- */
 
+type AdminRow = typeof adminAccounts.$inferSelect;
+
+/** Convert a Drizzle row into the stable snake_case service row type. */
+function toAdminRow(r: AdminRow): AdminAccountRow {
+  return {
+    id: r.id,
+    username: r.username,
+    email: r.email,
+    display_name: r.displayName,
+    password_hash: r.passwordHash,
+    credentials_source: r.credentialsSource === "database" ? "database" : "env_bootstrap",
+    password_updated_at: toIso(r.passwordUpdatedAt) ?? new Date().toISOString(),
+    is_active: r.isActive,
+    last_login_at: toIso(r.lastLoginAt),
+    created_at: toIso(r.createdAt) ?? new Date().toISOString(),
+    updated_at: toIso(r.updatedAt) ?? new Date().toISOString(),
+  };
+}
+
 /** Fetch an administrator account by username (exact, lowercased). */
 export async function getAdminByUsername(username: string): Promise<AdminAccountRow | null> {
-  const { data, error } = await getSupabaseServiceClient()
-    .from("admin_accounts")
-    .select("*")
-    .eq("username", username.trim().toLowerCase())
-    .maybeSingle<AdminAccountRow>();
-  if (error) {
-    throw new SystemAuthError(`admin lookup failed (${error.code ?? ""})`);
+  try {
+    const rows = await getDb()
+      .select()
+      .from(adminAccounts)
+      .where(eq(adminAccounts.username, username.trim().toLowerCase()))
+      .limit(1);
+    return rows[0] ? toAdminRow(rows[0]) : null;
+  } catch (err) {
+    throw dbSystemError("admin_accounts.select", err);
   }
-  return data ?? null;
 }
 
 /** Fetch an administrator account by id (used by flows and account settings). */
 export async function getAdminById(adminId: string): Promise<AdminAccountRow | null> {
-  const { data, error } = await getSupabaseServiceClient()
-    .from("admin_accounts")
-    .select("*")
-    .eq("id", adminId)
-    .maybeSingle<AdminAccountRow>();
-  if (error) {
-    throw new SystemAuthError(`admin lookup failed (${error.code ?? ""})`);
+  try {
+    const rows = await getDb().select().from(adminAccounts).where(eq(adminAccounts.id, adminId)).limit(1);
+    return rows[0] ? toAdminRow(rows[0]) : null;
+  } catch (err) {
+    throw dbSystemError("admin_accounts.select", err);
   }
-  return data ?? null;
 }
 
 /** Issue a fresh OTP challenge for an administrator (invalidates previous ones). */
 async function issueOtpForAdmin(admin: AdminAccountRow): Promise<IssuedOtp> {
-  const db = getSupabaseServiceClient();
+  const db = getDb();
 
   // Rate limit: hard cap of OTP emails per rolling hour.
   await enforceRateLimit("auth:otp-issue", OTP_ISSUE_HOURLY_LIMIT, 60 * 60);
 
   // Controlled cooldown between consecutive OTP issues (resend protection).
-  const { data: lastChallenge, error: lastError } = await db
-    .from("auth_otp_challenges")
-    .select("id, created_at")
-    .eq("admin_id", admin.id)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle<{ id: string; created_at: string }>();
-  if (lastError) {
-    throw new SystemAuthError(`otp cooldown lookup failed (${lastError.code ?? ""})`);
+  let lastChallenge: { createdAt: Date } | undefined;
+  try {
+    const rows = await db
+      .select({ createdAt: authOtpChallenges.createdAt })
+      .from(authOtpChallenges)
+      .where(eq(authOtpChallenges.adminId, admin.id))
+      .orderBy(desc(authOtpChallenges.createdAt))
+      .limit(1);
+    lastChallenge = rows[0];
+  } catch (err) {
+    throw dbSystemError("auth_otp_challenges.select", err);
   }
   if (lastChallenge) {
-    const elapsed = (Date.now() - Date.parse(lastChallenge.created_at)) / 1000;
+    const elapsed = (Date.now() - lastChallenge.createdAt.getTime()) / 1000;
     const wait = Math.ceil(OTP_RESEND_COOLDOWN_SECONDS - elapsed);
     if (wait > 0) {
       throw new PublicAuthError(
@@ -88,22 +109,31 @@ async function issueOtpForAdmin(admin: AdminAccountRow): Promise<IssuedOtp> {
   }
 
   // Issuing a new code invalidates every previous unconsumed challenge.
-  await db.rpc("auth_invalidate_pending_otps", { p_admin_id: admin.id });
+  try {
+    await getSql()`select auth_invalidate_pending_otps(${admin.id}::uuid)`;
+  } catch (err) {
+    throw dbSystemError("auth_invalidate_pending_otps", err);
+  }
 
   const code = generateOtpCode();
-  const expiresAt = new Date(Date.now() + OTP_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + OTP_TTL_SECONDS * 1000);
 
-  const { data: challenge, error: insertError } = await db
-    .from("auth_otp_challenges")
-    .insert({
-      admin_id: admin.id,
-      code_hash: hashOtpCode(code),
-      expires_at: expiresAt,
-      max_attempts: OTP_MAX_ATTEMPTS,
-    })
-    .select("id, expires_at")
-    .single<{ id: string; expires_at: string }>();
-  if (insertError || !challenge) {
+  let challenge: { id: string; expiresAt: Date } | undefined;
+  try {
+    const rows = await db
+      .insert(authOtpChallenges)
+      .values({
+        adminId: admin.id,
+        codeHash: hashOtpCode(code),
+        expiresAt,
+        maxAttempts: OTP_MAX_ATTEMPTS,
+      })
+      .returning({ id: authOtpChallenges.id, expiresAt: authOtpChallenges.expiresAt });
+    challenge = rows[0];
+  } catch (err) {
+    throw dbSystemError("auth_otp_challenges.insert", err);
+  }
+  if (!challenge) {
     throw new SystemAuthError("otp challenge insert failed");
   }
 
@@ -111,14 +141,14 @@ async function issueOtpForAdmin(admin: AdminAccountRow): Promise<IssuedOtp> {
     await sendOtpEmail(admin.email, code);
   } catch (err) {
     // Fail CLOSED: an undeliverable code must not remain active.
-    await db.from("auth_otp_challenges").delete().eq("id", challenge.id);
+    await db.delete(authOtpChallenges).where(eq(authOtpChallenges.id, challenge.id)).catch(() => undefined);
     throw err;
   }
 
   return {
     challengeId: challenge.id,
     adminId: admin.id,
-    expiresAt: challenge.expires_at,
+    expiresAt: challenge.expiresAt.toISOString(),
     emailMasked: maskEmail(admin.email),
     resendCooldownSeconds: OTP_RESEND_COOLDOWN_SECONDS,
   };
@@ -174,6 +204,11 @@ export async function submitCredentials(input: {
       meta: input.meta,
     });
     if (failureState.isLocked) {
+      await logSecurityEvent("lockout_activated", {
+        adminId: admin?.id ?? null,
+        meta: input.meta,
+        detail: { failures: failureState.consecutiveFailures },
+      });
       return { status: "locked", lockout: failureState };
     }
     return {
@@ -228,15 +263,16 @@ export async function verifyOtp(input: {
     return { status: "invalid" };
   }
 
-  const { data, error } = await getSupabaseServiceClient().rpc("auth_consume_otp", {
-    p_challenge_id: input.challengeId,
-    p_admin_id: input.adminId,
-    p_code_hash: hashOtpCode(code.data),
-  });
-  if (error) {
-    throw new SystemAuthError(`otp consume failed (${error.code ?? ""})`);
+  let consumeStatus: OtpConsumeStatus;
+  try {
+    const sql = getSql();
+    const rows = await sql<{ result: { status?: string } }[]>`
+      select auth_consume_otp(${input.challengeId}::uuid, ${input.adminId}::uuid, ${hashOtpCode(code.data)}::text) as result
+    `;
+    consumeStatus = (rows[0]?.result?.status ?? "not_found") as OtpConsumeStatus;
+  } catch (err) {
+    throw dbSystemError("auth_consume_otp", err);
   }
-  const consumeStatus = ((data ?? {}) as { status?: string }).status as OtpConsumeStatus;
 
   if (consumeStatus !== "verified") {
     const failureState = await registerAuthFailure();
@@ -246,7 +282,14 @@ export async function verifyOtp(input: {
       adminId: input.adminId,
       meta: input.meta,
     });
-    if (failureState.isLocked) return { status: "locked", lockout: failureState };
+    if (failureState.isLocked) {
+      await logSecurityEvent("lockout_activated", {
+        adminId: input.adminId,
+        meta: input.meta,
+        detail: { failures: failureState.consecutiveFailures },
+      });
+      return { status: "locked", lockout: failureState };
+    }
     return { status: consumeStatus };
   }
 
@@ -264,14 +307,19 @@ export async function verifyOtp(input: {
     throw new SystemAuthError("admin account disappeared during verification");
   }
 
-  // Best-effort bookkeeping.
-  void getSupabaseServiceClient()
-    .from("admin_accounts")
-    .update({ last_login_at: new Date().toISOString() })
-    .eq("id", admin.id)
-    .then(({ error: err }) => {
-      if (err) logAuthEvent("last_login_update_failed", { code: err.code ?? "" });
+  // last_login_at: ONLY a complete (OTP-verified) login updates it.
+  void getDb()
+    .update(adminAccounts)
+    .set({ lastLoginAt: new Date() })
+    .where(eq(adminAccounts.id, admin.id))
+    .catch((err: unknown) => {
+      logAuthEvent("last_login_update_failed", { code: (err as { code?: string })?.code ?? "" });
     });
+  await logSecurityEvent("login_success", {
+    adminId: admin.id,
+    meta: input.meta,
+    detail: { username: admin.username },
+  });
 
   return { status: "verified", admin };
 }
@@ -305,12 +353,15 @@ export async function resendOtp(input: {
 
 /**
  * Destructive reset of global authentication state. Exists ONLY for the
- * staging test suite and operator disaster recovery (run via the service key
- * from a trusted shell). There is deliberately NO public endpoint that calls
- * this — a lockout can never be reset from the browser.
+ * staging test suite and operator disaster recovery (run from a trusted
+ * shell with database access). There is deliberately NO public endpoint that
+ * calls this — a lockout can never be reset from the browser.
  */
 export async function resetGlobalAuthStateForTests(): Promise<void> {
-  const db = getSupabaseServiceClient();
-  await db.from("security_lockouts").delete().eq("id", "GLOBAL");
-  await db.from("rate_limits").delete().like("key", "auth:%");
+  const db = getDb();
+  await db.execute(sql`delete from public.security_lockouts where id = 'GLOBAL'`);
+  await db.execute(sql`delete from public.rate_limits where key like 'auth:%'`);
 }
+
+/** Exposed for the account layer and tests: same reset under a scoped name. */
+export const resetRateLimitsForTests = resetGlobalAuthStateForTests;

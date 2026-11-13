@@ -27,9 +27,10 @@ import path from "node:path";
 import { loadDotEnv } from "./load-env";
 import { check, checkEqual, rejects, section, finish } from "./test-harness";
 
-loadDotEnv(".env");
+loadDotEnv(".env", { override: true });
+/** Owner-level test client + unprivileged probe client (see test-db.ts). */
+import { opsClient, anonClient } from "./test-db";
 
-import { createClient } from "@supabase/supabase-js";
 import {
   submitCredentials,
   verifyOtp,
@@ -45,19 +46,6 @@ import { getServerEnv } from "../src/lib/config/env";
 const env = getServerEnv();
 const OUTBOX = path.resolve(process.cwd(), env.SMTP_DEV_OUTBOX);
 
-/** Fresh service-role client (independent of the app's cached singleton). */
-function opsClient() {
-  return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-/** Fresh ANON client — proves anonymous access stays blocked. */
-function anonClient() {
-  return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.NEXT_PUBLIC_SUPABASE_ANON_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
 
 const META = { ipAddress: "127.0.0.1", userAgent: "niyojan-test-suite/1.0" };
 
@@ -375,9 +363,14 @@ async function main(): Promise<void> {
   checkEqual(blocked.status, "locked", "even CORRECT credentials are rejected while locked");
 
   // ...and failed requests cannot manipulate the timer:
-  const before = (await ops.from("security_lockouts").select("locked_until").eq("id", "GLOBAL").maybeSingle()).data?.locked_until;
+  const readLockedUntilMs = async (): Promise<number | null> => {
+    const { data } = await ops.from("security_lockouts").select("locked_until").eq("id", "GLOBAL").maybeSingle();
+    const value = data?.locked_until;
+    return value ? new Date(value as string | Date).getTime() : null;
+  };
+  const before = await readLockedUntilMs();
   await submitCredentials({ username: env.ADMIN_USERNAME, password: "another-wrong", meta: META }).catch(() => undefined);
-  const after = (await ops.from("security_lockouts").select("locked_until").eq("id", "GLOBAL").maybeSingle()).data?.locked_until;
+  const after = await readLockedUntilMs();
   checkEqual(after, before, "failed requests neither extend nor reset the lockout timer");
 
   // The login flow is unavailable: rendering also reports the lockout.

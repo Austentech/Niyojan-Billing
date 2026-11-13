@@ -1,8 +1,13 @@
-import { getSupabaseServiceClient, dbSystemError } from "@/lib/auth/server/db";
+import { and, desc, eq, ilike, ne, sql } from "drizzle-orm";
+
+import { getDb, getSql } from "@/lib/db";
+import { adminAccounts, adminSessions, corporationProfile, emailChangeRequests } from "@/lib/db/schema";
+import { dbSystemError } from "@/lib/auth/server/db";
 import { verifyPassword, hashPassword } from "@/lib/auth/server/password";
 import { generateOtpCode, hashOtpCode } from "@/lib/auth/server/otp";
 import { sendEmailChangeCode } from "@/lib/auth/server/email";
 import { enforceRateLimit } from "@/lib/auth/server/rate-limit";
+import { logSecurityEvent } from "@/lib/auth/server/audit";
 import { getAdminById } from "@/lib/auth/service";
 import { BRAND, EMAIL_CHANGE_POLICY, RATE_LIMITS } from "@/lib/constants";
 import { maskEmail, type AdminAccountRow } from "@/lib/auth/types";
@@ -30,7 +35,7 @@ import {
  *     admin_accounts.
  *   * Administrator email changes are verification-gated: requestEmailChange
  *     emails an 8-character code to the NEW address; only confirmEmailChange
- *     (atomic RPC account_consume_email_change) can activate the address.
+ *     (atomic account_consume_email_change) can activate the address.
  *   * The password change verifies the current credential, stores the new one
  *     as an Argon2id hash, flips credentials_source to 'database' (the
  *     environment bootstrap can never overwrite it again) and revokes every
@@ -40,7 +45,7 @@ import {
  *   * Only the HMAC-SHA256 hash of a verification code is ever stored.
  *   * Verification codes appear only in the outgoing email and in memory —
  *     never in responses, logs or client state.
- *   * Parameterized queries only (PostgREST); error surfaces carry safe
+ *   * Parameterized Drizzle statements only; error surfaces carry safe
  *     public messages, system detail goes to the server log.
  */
 
@@ -54,16 +59,21 @@ export interface CorporationProfileView {
   updatedAt: string;
 }
 
-interface CorporationProfileRow {
-  id: string;
-  corporation_name: string;
-  logo_url: string | null;
-  created_at: string;
-  updated_at: string;
+const CORPORATION_PROFILE_ID = "CORPORATION";
+
+interface CorporationRow {
+  corporationName: string;
+  logoUrl: string | null;
+  updatedAt: Date;
 }
 
-const CORPORATION_PROFILE_ID = "CORPORATION";
-const CORPORATION_SELECT = "id, corporation_name, logo_url, created_at, updated_at";
+function toProfileView(row: CorporationRow): CorporationProfileView {
+  return {
+    corporationName: row.corporationName,
+    logoUrl: row.logoUrl ?? null,
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
 
 /**
  * Read the corporation profile, seeding the single row from the brand
@@ -71,56 +81,48 @@ const CORPORATION_SELECT = "id, corporation_name, logo_url, created_at, updated_
  * The bundled official logo asset is used while logo_url is null.
  */
 export async function getCorporationProfile(): Promise<CorporationProfileView> {
-  const db = getSupabaseServiceClient();
+  const db = getDb();
 
-  const { data: existing, error: selectError } = await db
-    .from("corporation_profile")
-    .select(CORPORATION_SELECT)
-    .eq("id", CORPORATION_PROFILE_ID)
-    .maybeSingle<CorporationProfileRow>();
-  if (selectError) {
-    throw new SystemAccountError(`corporation_profile.select failed (${selectError.code ?? ""})`);
+  let existing: CorporationRow | undefined;
+  try {
+    const rows = await db
+      .select({ corporationName: corporationProfile.corporationName, logoUrl: corporationProfile.logoUrl, updatedAt: corporationProfile.updatedAt })
+      .from(corporationProfile)
+      .where(eq(corporationProfile.id, CORPORATION_PROFILE_ID))
+      .limit(1);
+    existing = rows[0];
+  } catch (err) {
+    throw dbSystemError("corporation_profile.select", err);
   }
-  if (existing) {
-    return {
-      corporationName: existing.corporation_name,
-      logoUrl: existing.logo_url ?? null,
-      updatedAt: existing.updated_at,
-    };
-  }
+  if (existing) return toProfileView(existing);
 
-  // First access — seed the row with the brand defaults.
-  const { data: seeded, error: insertError } = await db
-    .from("corporation_profile")
-    .upsert(
-      { id: CORPORATION_PROFILE_ID, corporation_name: BRAND.name, logo_url: null },
-      { onConflict: "id", ignoreDuplicates: false },
-    )
-    .select(CORPORATION_SELECT)
-    .single<CorporationProfileRow>();
-  if (insertError || !seeded) {
-    // Lost an insert race — re-read whatever the winner stored.
-    const { data: reread } = await db
-      .from("corporation_profile")
-      .select(CORPORATION_SELECT)
-      .eq("id", CORPORATION_PROFILE_ID)
-      .maybeSingle<CorporationProfileRow>();
-    if (reread) {
-      return {
-        corporationName: reread.corporation_name,
-        logoUrl: reread.logo_url ?? null,
-        updatedAt: reread.updated_at,
-      };
+  // First access — seed the row with the brand defaults (race-safe).
+  try {
+    const rows = await db
+      .insert(corporationProfile)
+      .values({ id: CORPORATION_PROFILE_ID, corporationName: BRAND.name, logoUrl: null })
+      .onConflictDoNothing({ target: corporationProfile.id })
+      .returning({ corporationName: corporationProfile.corporationName, logoUrl: corporationProfile.logoUrl, updatedAt: corporationProfile.updatedAt });
+    if (rows[0]) {
+      logAccountEvent("corporation_profile_seeded", {});
+      return toProfileView(rows[0]);
     }
-    throw new SystemAccountError(`corporation_profile.upsert failed (${insertError?.code ?? "no row"})`);
+  } catch (err) {
+    // Lost an insert race — fall through and re-read the winner's row.
+    logAccountError("corporation_profile_seed_race", err);
   }
 
-  logAccountEvent("corporation_profile_seeded", {});
-  return {
-    corporationName: seeded.corporation_name,
-    logoUrl: seeded.logo_url ?? null,
-    updatedAt: seeded.updated_at,
-  };
+  try {
+    const rows = await db
+      .select({ corporationName: corporationProfile.corporationName, logoUrl: corporationProfile.logoUrl, updatedAt: corporationProfile.updatedAt })
+      .from(corporationProfile)
+      .where(eq(corporationProfile.id, CORPORATION_PROFILE_ID))
+      .limit(1);
+    if (rows[0]) return toProfileView(rows[0]);
+  } catch (err) {
+    // fall through to the error below
+  }
+  throw new SystemAccountError("corporation_profile.upsert failed (no row)");
 }
 
 export type UpdateCorporationProfileResult =
@@ -131,7 +133,7 @@ export type UpdateCorporationProfileResult =
  * Update the corporation profile (name and/or logo URL). `logoUrl` semantics:
  *   * undefined — keep the current logo untouched,
  *   * null       — remove the custom logo (fall back to the official asset),
- *   * string     — newly stored logo public URL.
+ *   * string     — newly stored logo public URL (upload or validated URL).
  */
 export async function updateCorporationProfile(input: {
   corporationName: string;
@@ -144,30 +146,28 @@ export async function updateCorporationProfile(input: {
 
   await getCorporationProfile(); // guarantees the row exists
 
-  const patch: Record<string, string | null> = { corporation_name: parsed.data };
+  const patch: { corporationName: string; logoUrl?: string | null } = { corporationName: parsed.data };
   if (input.logoUrl !== undefined) {
-    patch.logo_url = input.logoUrl;
+    patch.logoUrl = input.logoUrl;
   }
 
-  const { data, error } = await getSupabaseServiceClient()
-    .from("corporation_profile")
-    .update(patch)
-    .eq("id", CORPORATION_PROFILE_ID)
-    .select(CORPORATION_SELECT)
-    .single<CorporationProfileRow>();
-  if (error || !data) {
-    throw new SystemAccountError(`corporation_profile.update failed (${error?.code ?? "no row"})`);
+  let row: CorporationRow | undefined;
+  try {
+    const rows = await getDb()
+      .update(corporationProfile)
+      .set(patch)
+      .where(eq(corporationProfile.id, CORPORATION_PROFILE_ID))
+      .returning({ corporationName: corporationProfile.corporationName, logoUrl: corporationProfile.logoUrl, updatedAt: corporationProfile.updatedAt });
+    row = rows[0];
+  } catch (err) {
+    throw dbSystemError("corporation_profile.update", err);
+  }
+  if (!row) {
+    throw dbSystemError("corporation_profile.update", null);
   }
 
-  logAccountEvent("corporation_profile_updated", { has_custom_logo: data.logo_url !== null });
-  return {
-    status: "updated",
-    profile: {
-      corporationName: data.corporation_name,
-      logoUrl: data.logo_url ?? null,
-      updatedAt: data.updated_at,
-    },
-  };
+  logAccountEvent("corporation_profile_updated", { has_custom_logo: row.logoUrl !== null });
+  return { status: "updated", profile: toProfileView(row) };
 }
 
 /* ============================================================================
@@ -191,21 +191,23 @@ export async function updateDisplayName(input: {
     };
   }
 
-  const { data, error } = await getSupabaseServiceClient()
-    .from("admin_accounts")
-    .update({ display_name: parsed.data })
-    .eq("id", input.adminId)
-    .select("id, display_name")
-    .maybeSingle<{ id: string; display_name: string }>();
-  if (error) {
-    throw new SystemAccountError(`admin_accounts.update failed (${error.code ?? ""})`);
+  let row: { id: string; displayName: string } | undefined;
+  try {
+    const rows = await getDb()
+      .update(adminAccounts)
+      .set({ displayName: parsed.data })
+      .where(eq(adminAccounts.id, input.adminId))
+      .returning({ id: adminAccounts.id, displayName: adminAccounts.displayName });
+    row = rows[0];
+  } catch (err) {
+    throw dbSystemError("admin_accounts.update", err);
   }
-  if (!data) {
+  if (!row) {
     return { status: "not_found" };
   }
 
-  logAccountEvent("display_name_updated", { admin_id: data.id });
-  return { status: "updated", displayName: data.display_name };
+  logAccountEvent("display_name_updated", { admin_id: row.id });
+  return { status: "updated", displayName: row.displayName };
 }
 
 /* ============================================================================
@@ -214,13 +216,12 @@ export async function updateDisplayName(input: {
 
 interface EmailChangeRequestRow {
   id: string;
-  admin_id: string;
-  new_email: string;
-  expires_at: string;
+  newEmail: string;
+  expiresAt: Date;
   attempts: number;
-  max_attempts: number;
-  consumed_at: string | null;
-  created_at: string;
+  maxAttempts: number;
+  consumedAt: Date | null;
+  createdAt: Date;
 }
 
 export interface PendingEmailChange {
@@ -231,20 +232,29 @@ export interface PendingEmailChange {
 
 /** Latest unconsumed, unexpired email-change request for an administrator. */
 async function getActiveEmailChangeRequest(adminId: string): Promise<EmailChangeRequestRow | null> {
-  const { data, error } = await getSupabaseServiceClient()
-    .from("email_change_requests")
-    .select("id, admin_id, new_email, expires_at, attempts, max_attempts, consumed_at, created_at")
-    .eq("admin_id", adminId)
-    .is("consumed_at", null)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle<EmailChangeRequestRow>();
-  if (error) {
-    throw new SystemAccountError(`email_change_requests.select failed (${error.code ?? ""})`);
+  let row: EmailChangeRequestRow | undefined;
+  try {
+    const rows = await getDb()
+      .select({
+        id: emailChangeRequests.id,
+        newEmail: emailChangeRequests.newEmail,
+        expiresAt: emailChangeRequests.expiresAt,
+        attempts: emailChangeRequests.attempts,
+        maxAttempts: emailChangeRequests.maxAttempts,
+        consumedAt: emailChangeRequests.consumedAt,
+        createdAt: emailChangeRequests.createdAt,
+      })
+      .from(emailChangeRequests)
+      .where(and(eq(emailChangeRequests.adminId, adminId), sql`consumed_at is null`))
+      .orderBy(desc(emailChangeRequests.createdAt))
+      .limit(1);
+    row = rows[0];
+  } catch (err) {
+    throw dbSystemError("email_change_requests.select", err);
   }
-  if (!data) return null;
-  if (Date.parse(data.expires_at) <= Date.now()) return null;
-  return data;
+  if (!row) return null;
+  if (row.expiresAt.getTime() <= Date.now()) return null;
+  return row;
 }
 
 /** Public view of a pending request for UI rendering (masked address only). */
@@ -252,14 +262,14 @@ export async function getPendingEmailChange(adminId: string): Promise<PendingEma
   const active = await getActiveEmailChangeRequest(adminId);
   if (!active) return null;
   return {
-    newEmailMasked: maskEmail(active.new_email),
-    expiresAt: active.expires_at,
+    newEmailMasked: maskEmail(active.newEmail),
+    expiresAt: active.expiresAt.toISOString(),
     resendCooldownSeconds: EMAIL_CHANGE_POLICY.resendCooldownSeconds,
   };
 }
 
 async function issueEmailChangeRequest(admin: AdminAccountRow, newEmail: string): Promise<PendingEmailChange> {
-  const db = getSupabaseServiceClient();
+  const db = getDb();
 
   // Hard cap of verification emails per rolling hour.
   await enforceRateLimit(
@@ -269,18 +279,20 @@ async function issueEmailChangeRequest(admin: AdminAccountRow, newEmail: string)
   );
 
   // Controlled cooldown between consecutive requests (resend protection).
-  const { data: lastRequest, error: lastError } = await db
-    .from("email_change_requests")
-    .select("id, created_at")
-    .eq("admin_id", admin.id)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle<{ id: string; created_at: string }>();
-  if (lastError) {
-    throw new SystemAccountError(`email_change_requests.select failed (${lastError.code ?? ""})`);
+  let lastRequest: { createdAt: Date } | undefined;
+  try {
+    const rows = await db
+      .select({ createdAt: emailChangeRequests.createdAt })
+      .from(emailChangeRequests)
+      .where(eq(emailChangeRequests.adminId, admin.id))
+      .orderBy(desc(emailChangeRequests.createdAt))
+      .limit(1);
+    lastRequest = rows[0];
+  } catch (err) {
+    throw dbSystemError("email_change_requests.select", err);
   }
   if (lastRequest) {
-    const elapsed = (Date.now() - Date.parse(lastRequest.created_at)) / 1000;
+    const elapsed = (Date.now() - lastRequest.createdAt.getTime()) / 1000;
     const wait = Math.ceil(EMAIL_CHANGE_POLICY.resendCooldownSeconds - elapsed);
     if (wait > 0) {
       throw new PublicAccountError(
@@ -292,23 +304,32 @@ async function issueEmailChangeRequest(admin: AdminAccountRow, newEmail: string)
   }
 
   // Issuing a new request retires every previous unconsumed one.
-  await db.rpc("account_invalidate_pending_email_changes", { p_admin_id: admin.id });
+  try {
+    await getSql()`select account_invalidate_pending_email_changes(${admin.id}::uuid)`;
+  } catch (err) {
+    throw dbSystemError("account_invalidate_pending_email_changes", err);
+  }
 
   const code = generateOtpCode();
-  const expiresAt = new Date(Date.now() + EMAIL_CHANGE_POLICY.ttlSeconds * 1000).toISOString();
+  const expiresAt = new Date(Date.now() + EMAIL_CHANGE_POLICY.ttlSeconds * 1000);
 
-  const { data: request, error: insertError } = await db
-    .from("email_change_requests")
-    .insert({
-      admin_id: admin.id,
-      new_email: newEmail,
-      code_hash: hashOtpCode(code),
-      expires_at: expiresAt,
-      max_attempts: EMAIL_CHANGE_POLICY.maxAttempts,
-    })
-    .select("id, expires_at")
-    .single<{ id: string; expires_at: string }>();
-  if (insertError || !request) {
+  let request: { id: string; expiresAt: Date } | undefined;
+  try {
+    const rows = await db
+      .insert(emailChangeRequests)
+      .values({
+        adminId: admin.id,
+        newEmail,
+        codeHash: hashOtpCode(code),
+        expiresAt,
+        maxAttempts: EMAIL_CHANGE_POLICY.maxAttempts,
+      })
+      .returning({ id: emailChangeRequests.id, expiresAt: emailChangeRequests.expiresAt });
+    request = rows[0];
+  } catch (err) {
+    throw dbSystemError("email_change_requests.insert", err);
+  }
+  if (!request) {
     throw new SystemAccountError("email_change_requests.insert failed");
   }
 
@@ -316,14 +337,14 @@ async function issueEmailChangeRequest(admin: AdminAccountRow, newEmail: string)
     await sendEmailChangeCode(newEmail, code);
   } catch (err) {
     // Fail CLOSED: an undeliverable code must not remain active.
-    await db.from("email_change_requests").delete().eq("id", request.id);
+    await db.delete(emailChangeRequests).where(eq(emailChangeRequests.id, request.id)).catch(() => undefined);
     throw err;
   }
 
   logAccountEvent("email_change_requested", { admin_id: admin.id, request_id: request.id });
   return {
     newEmailMasked: maskEmail(newEmail),
-    expiresAt: request.expires_at,
+    expiresAt: request.expiresAt.toISOString(),
     resendCooldownSeconds: EMAIL_CHANGE_POLICY.resendCooldownSeconds,
   };
 }
@@ -361,16 +382,18 @@ export async function requestEmailChange(input: {
   }
 
   // Uniqueness: the address must not belong to any administrator account.
-  const { data: clash, error: clashError } = await getSupabaseServiceClient()
-    .from("admin_accounts")
-    .select("id")
-    .ilike("email", newEmail)
-    .neq("id", admin.id)
-    .limit(1);
-  if (clashError) {
-    throw new SystemAccountError(`admin_accounts.select failed (${clashError.code ?? ""})`);
+  let clash: { id: string } | undefined;
+  try {
+    const rows = await getDb()
+      .select({ id: adminAccounts.id })
+      .from(adminAccounts)
+      .where(and(ilike(adminAccounts.email, newEmail), ne(adminAccounts.id, admin.id)))
+      .limit(1);
+    clash = rows[0];
+  } catch (err) {
+    throw dbSystemError("admin_accounts.select", err);
   }
-  if (clash && clash.length > 0) {
+  if (clash) {
     return {
       status: "invalid",
       fieldErrors: { email: "This email address is already in use by an administrator account." },
@@ -380,12 +403,12 @@ export async function requestEmailChange(input: {
   // Idempotency: re-submitting the SAME pending address must not burn the
   // resend cooldown or email a second code — the active request is returned.
   const active = await getActiveEmailChangeRequest(admin.id);
-  if (active && active.new_email.toLowerCase() === newEmail) {
+  if (active && active.newEmail.toLowerCase() === newEmail) {
     return {
       status: "requested",
       pending: {
-        newEmailMasked: maskEmail(active.new_email),
-        expiresAt: active.expires_at,
+        newEmailMasked: maskEmail(active.newEmail),
+        expiresAt: active.expiresAt.toISOString(),
         resendCooldownSeconds: EMAIL_CHANGE_POLICY.resendCooldownSeconds,
       },
     };
@@ -422,17 +445,21 @@ export async function confirmEmailChange(input: {
     return { status: "invalid" };
   }
 
-  const { data, error } = await getSupabaseServiceClient().rpc("account_consume_email_change", {
-    p_admin_id: input.adminId,
-    p_code_hash: hashOtpCode(parsed.data),
-  });
-  if (error) {
-    throw new SystemAccountError(`account_consume_email_change failed (${error.code ?? ""})`);
+  let raw: { status?: string; new_email?: string } | undefined;
+  try {
+    const sql = getSql();
+    const rows = await sql<{ result: { status?: string; new_email?: string } }[]>`
+      select account_consume_email_change(${input.adminId}::uuid, ${hashOtpCode(parsed.data)}::text) as result
+    `;
+    raw = rows[0]?.result;
+  } catch (err) {
+    throw dbSystemError("account_consume_email_change", err);
   }
-  const raw = (data ?? {}) as { status?: string; new_email?: string };
-  switch (raw.status) {
+
+  switch (raw?.status) {
     case "verified":
       logAccountEvent("email_change_confirmed", { admin_id: input.adminId });
+      await logSecurityEvent("admin_email_changed", { adminId: input.adminId, detail: {} });
       return { status: "verified", newEmail: raw.new_email ?? "" };
     case "expired":
       return { status: "expired" };
@@ -452,8 +479,6 @@ export type ResendEmailChangeResult =
 
 /** Re-issue the confirmation code for the CURRENT pending request (if any). */
 export async function resendEmailChangeCode(input: { adminId: string }): Promise<ResendEmailChangeResult> {
-  const db = getSupabaseServiceClient();
-
   const active = await getActiveEmailChangeRequest(input.adminId);
   if (!active) {
     return { status: "not_found" };
@@ -466,7 +491,7 @@ export async function resendEmailChangeCode(input: { adminId: string }): Promise
     return { status: "not_found" };
   }
 
-  const pending = await issueEmailChangeRequest(admin, active.new_email);
+  const pending = await issueEmailChangeRequest(admin, active.newEmail);
   return { status: "requested", pending };
 }
 
@@ -511,39 +536,45 @@ export async function changeAdminPassword(input: {
   }
 
   const passwordHash = await hashPassword(input.newPassword);
-  const db = getSupabaseServiceClient();
-  const { error: updateError } = await db
-    .from("admin_accounts")
-    .update({
-      password_hash: passwordHash,
-      credentials_source: "database",
-      password_updated_at: new Date().toISOString(),
-    })
-    .eq("id", input.adminId);
-  if (updateError) {
-    throw new SystemAccountError(`admin_accounts.update failed (${updateError.code ?? ""})`);
+  const db = getDb();
+  try {
+    await db
+      .update(adminAccounts)
+      .set({
+        passwordHash,
+        credentialsSource: "database",
+        passwordUpdatedAt: new Date(),
+      })
+      .where(eq(adminAccounts.id, input.adminId));
+  } catch (err) {
+    throw dbSystemError("admin_accounts.update", err);
   }
 
   // Revoke every OTHER session (best-effort: the credential is already
   // updated; a revoke failure is logged and does not fail the change).
-  const revokeFilter = db
-    .from("admin_sessions")
-    .update({ revoked_at: new Date().toISOString() })
-    .eq("admin_id", input.adminId)
-    .is("revoked_at", null);
-  const { error: revokeError } =
-    input.keepSessionId !== undefined
-      ? await revokeFilter.neq("id", input.keepSessionId)
-      : await revokeFilter;
-  if (revokeError) {
+  try {
+    const revokeFilter =
+      input.keepSessionId !== undefined
+        ? and(
+            eq(adminSessions.adminId, input.adminId),
+            sql`revoked_at is null`,
+            ne(adminSessions.id, input.keepSessionId),
+          )
+        : and(eq(adminSessions.adminId, input.adminId), sql`revoked_at is null`);
+    await db.update(adminSessions).set({ revokedAt: new Date() }).where(revokeFilter);
+  } catch (err) {
     logAccountError(
       "password_change_session_revoke_failed",
-      dbSystemError("admin_sessions.update", revokeError),
+      dbSystemError("admin_sessions.update", err),
       { admin_id: input.adminId },
     );
   }
 
   logAccountEvent("password_changed", { admin_id: input.adminId });
+  await logSecurityEvent("admin_password_changed", {
+    adminId: input.adminId,
+    detail: { other_sessions_revoked: true },
+  });
   return { status: "changed" };
 }
 
@@ -597,8 +628,8 @@ export async function getAccountOverview(adminId: string): Promise<AccountOvervi
 
 /** Destructive reset of account-settings state. Staging test suite ONLY. */
 export async function resetAccountDataForTests(): Promise<void> {
-  const db = getSupabaseServiceClient();
-  await db.from("email_change_requests").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-  await db.from("corporation_profile").delete().eq("id", CORPORATION_PROFILE_ID);
-  await db.from("rate_limits").delete().like("key", "account:%");
+  const db = getDb();
+  await db.execute(sql`delete from public.email_change_requests`);
+  await db.execute(sql`delete from public.corporation_profile where id = 'CORPORATION'`);
+  await db.execute(sql`delete from public.rate_limits where key like 'account:%'`);
 }

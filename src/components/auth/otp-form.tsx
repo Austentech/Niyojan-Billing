@@ -60,6 +60,7 @@ export function OtpForm({
     }
   }, [verifyState, onLocked]);
 
+  /* eslint-disable react-hooks/set-state-in-effect -- this effect resets local form state exactly once per resend RESULT (useActionState response pattern) */
   useEffect(() => {
     if (resendState.status === "otp_required") {
       onDataRefresh({
@@ -77,7 +78,8 @@ export function OtpForm({
     } else if (resendState.status === "preauth_expired") {
       onRestart();
     }
-  }, [resendState, onDataRefresh, onLocked, onRestart]);
+  }, [resendState]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const resendMessage =
     resendState.status === "otp_required"
