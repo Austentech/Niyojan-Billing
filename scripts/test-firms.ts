@@ -359,16 +359,17 @@ async function main(): Promise<void> {
   checkEqual(await validateSessionToken(null), null, "no token -> no session context");
   checkEqual(await validateSessionToken("forged-token-attempt-aaaaaaaaaaaaaaaa"), null, "forged token -> no session context");
 
-  // RLS: the anon key cannot read or write firms:
+  // Privilege boundary: the unprivileged niyojan_anon role cannot read or
+  // write firms:
   const anon = anonClient();
   const anonSelect = await anon.from("firms").select("id");
-  check(Boolean(anonSelect.error) || (anonSelect.data?.length ?? 0) === 0, "anonymous Supabase key cannot read firms");
+  check(Boolean(anonSelect.error) || (anonSelect.data?.length ?? 0) === 0, "the unprivileged niyojan_anon role cannot read firms");
   const anonInsert = await anon.from("firms").insert({
     firm_name: "Ghost Firm",
     holding_percentage: 10,
     address: "Nowhere Lane, Void City",
   });
-  check(Boolean(anonInsert.error), "anonymous Supabase key cannot insert firms");
+  check(Boolean(anonInsert.error), "the unprivileged niyojan_anon role cannot insert firms");
 
   // Rate limiting on the write operation (service level):
   const rlKey = "firms:create";

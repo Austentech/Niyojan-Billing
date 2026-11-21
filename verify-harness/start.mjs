@@ -27,6 +27,17 @@ const PG_PORT = 5433;
 const DB_NAME = "niyojan";
 const DATABASE_URL = `postgres://postgres:postgres@127.0.0.1:${PG_PORT}/${DB_NAME}`;
 
+/* --- ICU 60 compatibility --------------------------------------------------- */
+/* The embedded PostgreSQL 18 binaries link libicuuc.so.60 (version-suffixed
+ * ICU symbols — a newer system ICU cannot substitute). If a compatible copy
+ * has been extracted into pglibs/icu60/ (see pglibs/icu60/README), prepend it
+ * to LD_LIBRARY_PATH so initdb/pg_ctl/postgres resolve it. No-op on machines
+ * where the system ICU already matches. */
+const ICU_DIR = path.join(HARNESS_DIR, "pglibs/icu60/extracted/usr/lib/x86_64-linux-gnu");
+if (existsSync(path.join(ICU_DIR, "libicuuc.so.60"))) {
+  process.env.LD_LIBRARY_PATH = [ICU_DIR, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":");
+}
+
 /* --- Helpers ------------------------------------------------------------------ */
 
 function spawnDetached(command, args, env, logFile) {
@@ -117,6 +128,7 @@ async function main() {
   // niyojan_anon: a LOGIN role with ZERO table privileges. The integration
   // tests connect as it to prove the unprivileged database surface stays
   // blocked (the successor to the Supabase-era anon/RLS checks).
+  const admin = await superuserClient();
   await admin.query(`do $$ begin
     if not exists (select 1 from pg_roles where rolname = 'niyojan_anon') then
       create role niyojan_anon login;

@@ -387,19 +387,20 @@ async function main(): Promise<void> {
   emailRow = await ops.from("admin_accounts").select("email").eq("id", adminId).maybeSingle();
   checkEqual(emailRow.data?.email, NEW_EMAIL, "an exhausted request never changes the email");
 
-  // RLS: the anon key can neither read nor drive the email-change machinery.
+  // Privilege boundary: the unprivileged niyojan_anon role can neither read
+  // nor drive the email-change machinery.
   const anon = anonClient();
   const anonRequests = await anon.from("email_change_requests").select("id");
-  check(Boolean(anonRequests.error) || (anonRequests.data?.length ?? 0) === 0, "anonymous Supabase key cannot read email_change_requests");
+  check(Boolean(anonRequests.error) || (anonRequests.data?.length ?? 0) === 0, "the unprivileged niyojan_anon role cannot read email_change_requests");
   const anonProfile = await anon.from("corporation_profile").select("id");
-  check(Boolean(anonProfile.error) || (anonProfile.data?.length ?? 0) === 0, "anonymous Supabase key cannot read corporation_profile");
+  check(Boolean(anonProfile.error) || (anonProfile.data?.length ?? 0) === 0, "the unprivileged niyojan_anon role cannot read corporation_profile");
   const anonProfileInsert = await anon.from("corporation_profile").insert({ corporation_name: "Ghost Corp" });
-  check(Boolean(anonProfileInsert.error), "anonymous Supabase key cannot write corporation_profile");
+  check(Boolean(anonProfileInsert.error), "the unprivileged niyojan_anon role cannot write corporation_profile");
   const anonRpc = await anon.rpc("account_consume_email_change", {
     p_admin_id: adminId,
     p_code_hash: "0".repeat(64),
   });
-  check(Boolean(anonRpc.error), "anonymous Supabase key cannot invoke account_consume_email_change");
+  check(Boolean(anonRpc.error), "the unprivileged niyojan_anon role cannot invoke account_consume_email_change");
 
   /* ==========================================================================
    * 5. CHANGING CORPORATION LOGO

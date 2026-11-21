@@ -67,6 +67,11 @@ verify-harness/harness-state.json
 verify-harness/postgrest.tar.xz
 verify-harness/bin/
 verify-harness/node_modules/
+verify-harness/bun.lock
+# ICU 60 compatibility libs for the embedded PostgreSQL binaries: only the
+# README (download provenance) is tracked; the extracted binaries are not.
+verify-harness/pglibs/**/*.deb
+verify-harness/pglibs/**/extracted/
 # niyojan phase 2 — firm logo artifacts (local storage adapter)
 .data/
 # The annotated environment reference is deliberately tracked.

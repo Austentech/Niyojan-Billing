@@ -94,9 +94,12 @@ export async function storeCorporationLogo(rawBytes: Buffer): Promise<string> {
 
   if (env.LOGO_STORAGE_MODE === "local") {
     const filename = `${randomUUID()}.${ext}`;
-    const dir = path.resolve(process.cwd(), CORPORATION_LOGO_LOCAL_DIR);
+    // turbopackIgnore: the local adapter writes to a runtime-created .data/
+    // directory (dev/harness only — rejected in production by env validation),
+    // so there is nothing for the build-time file tracer to include.
+    const dir = path.resolve(/*turbopackIgnore: true*/ process.cwd(), CORPORATION_LOGO_LOCAL_DIR);
     await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, filename), normalized);
+    await writeFile(path.join(/*turbopackIgnore: true*/ dir, filename), normalized);
     logAccountEvent("corporation_logo_stored", { mode: "local", bytes: normalized.length, mime });
     return `${CORPORATION_LOGO_PUBLIC_PREFIX}/${filename}`;
   }
@@ -113,5 +116,5 @@ export async function storeCorporationLogo(rawBytes: Buffer): Promise<string> {
  *  impossible). */
 export function localCorporationLogoPath(filename: string): string | null {
   if (!LOCAL_CORPORATION_LOGO_FILENAME_PATTERN.test(filename)) return null;
-  return path.resolve(process.cwd(), CORPORATION_LOGO_LOCAL_DIR, filename);
+  return path.resolve(/*turbopackIgnore: true*/ process.cwd(), CORPORATION_LOGO_LOCAL_DIR, filename);
 }

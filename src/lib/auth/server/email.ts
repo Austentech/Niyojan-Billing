@@ -210,11 +210,13 @@ async function deliverVerificationEmail(
 ): Promise<void> {
   if (isDevMailCaptureEnabled(env)) {
     try {
-      const outbox = path.resolve(process.cwd(), env.SMTP_DEV_OUTBOX);
+      // turbopackIgnore: dev-only outbox (runtime-created directory, never
+      // part of the build trace; SMTP_DEV_CAPTURE is rejected in production).
+      const outbox = path.resolve(/*turbopackIgnore: true*/ process.cwd(), env.SMTP_DEV_OUTBOX);
       await mkdir(outbox, { recursive: true });
       const filename = `${Date.now()}-${randomBytes(4).toString("hex")}.eml`;
       const raw = buildRawEml(env.SMTP_FROM, to, subject, text, html);
-      await writeFile(path.join(outbox, filename), raw, "utf8");
+      await writeFile(path.join(/*turbopackIgnore: true*/ outbox, filename), raw, "utf8");
       logAuthEvent(`${kind}_email_captured_to_dev_outbox`, {
         file: filename,
         recipient_domain: to.split("@")[1] ?? "",

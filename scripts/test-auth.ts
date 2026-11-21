@@ -531,12 +531,13 @@ async function main(): Promise<void> {
   check(Boolean(hasCredentialFailure), "audit log contains credential failures");
   check(Boolean(hasOtpSuccess), "audit log contains OTP successes");
 
-  // RLS: the anon key cannot touch authentication tables:
+  // Privilege boundary: the unprivileged niyojan_anon role cannot touch
+  // authentication tables:
   const anon = anonClient();
   const anonSelect = await anon.from("admin_accounts").select("id");
-  check(Boolean(anonSelect.error) || (anonSelect.data?.length ?? 0) === 0, "anonymous Supabase key cannot read admin_accounts");
+  check(Boolean(anonSelect.error) || (anonSelect.data?.length ?? 0) === 0, "the unprivileged niyojan_anon role cannot read admin_accounts");
   const anonRpc = await anon.rpc("auth_register_failure");
-  check(anonRpc.error !== null, "anonymous key cannot invoke security functions");
+  check(anonRpc.error !== null, "the unprivileged role cannot invoke security functions");
 
   // Final state hygiene for repeat runs:
   await resetAuthState();

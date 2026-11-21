@@ -8,7 +8,7 @@
 | Unit | `bun run test:unit` | No | OTP generation/hashing, normalization, Zod schemas (incl. the strong 12-char password policy), pre-auth cookie signing (tamper/expiry), Argon2id roundtrip, email masking, env validation hygiene |
 | Integration (auth) | `bun run test:auth` | Yes (`bun run harness:start` or a staging PostgreSQL) | The full 13-scenario Phase 1 matrix + extras |
 | Integration (firms) | `bun run test:firms` | Yes (same) | The full 12-scenario Phase 2 matrix + extras |
-| Integration (account) | `bun run test:account` | Yes (same) | The full 12-scenario Phase 3 matrix + extras | The full 12-scenario Phase 3 matrix + extras |
+| Integration (account) | `bun run test:account` | Yes (same) | The full 12-scenario Phase 3 matrix + extras |
 
 Run the unit suite first (it also sanity-checks the `.env` contract), then the
 integration suites.
@@ -41,8 +41,8 @@ the unprivileged database role (`niyojan_anon`, zero privileges) blocked from ta
 ## The Phase 2 required scenarios → automated assertions
 
 All 12 are asserted by `scripts/test-firms.ts` (91 checks total), which runs the
-same service/storage layers the application uses against the real PostgreSQL +
-PostgREST stack, plus HTTP-level checks against the dev server with a genuine
+same service/storage layers the application uses against the real PostgreSQL
+stack, plus HTTP-level checks against the dev server with a genuine
 session cookie:
 
 | # | Required scenario | Assertions in the suite |
@@ -58,7 +58,7 @@ session cookie:
 | 9 | Invalid website URL | Plain text, `ftp://`, `javascript:` and scheme-less URLs rejected |
 | 10 | Invalid holding percentage | `101`, `-5`, `12.345`, `abc`, empty rejected; boundary `0`/`100` and two-decimal values accepted |
 | 11 | Dashboard refresh after adding | New firm immediately in `listFirms` and in a freshly-rendered authenticated `/dashboard` and `/settings/firms` response (server revalidation) |
-| 12 | Unauthorized access to firm management | No cookie / forged cookie → `/dashboard`, `/settings/firms`, `/settings/account` all 307 to `/`; no/forged token → no session context; anon Supabase key cannot read or insert `firms`; write rate limiter denies past the window with retry-after |
+| 12 | Unauthorized access to firm management | No cookie / forged cookie → `/dashboard`, `/settings/firms`, `/settings/account` all 307 to `/`; no/forged token → no session context; the unprivileged `niyojan_anon` database role cannot read or insert `firms`; write rate limiter denies past the window with retry-after |
 
 **Extras** (also asserted): database CHECK constraints reject out-of-range
 holding even when the app layer is bypassed; XSS payloads in firm names render
@@ -70,15 +70,15 @@ Argon2id hash, invalidates the old credential, flips `credentials_source` to
 
 All 12 are asserted by `scripts/test-account.ts` (139 checks total), which runs
 the same account service/storage layers the application uses against the real
-PostgreSQL + PostgREST stack, plus HTTP-level checks against the dev server
-with a genuine session cookie:
+PostgreSQL stack, plus HTTP-level checks against the dev server with a genuine
+session cookie:
 
 | # | Required scenario | Assertions in the suite |
 | --- | --- | --- |
 | 1 | Displaying account information | `getAccountOverview` returns the administrator identity from the account configuration (name/email/username), the seeded corporation profile (name, NULL logo → official asset), credential source and the database `last_login_at`; authenticated `GET /settings/account` renders the overview card, corporation name, administrator name/email, last-login field and UTC-format timestamps (the local-timezone swap is client-side, browser-verified); unauthenticated request → 307 |
 | 2 | Updating corporation name | `updateCorporationProfile` → database row updated and reflected in the overview + a freshly-rendered page; empty / 1-char / 121-char names rejected with field errors; nothing written on invalid input; the DB CHECK constraint rejects a bad name even when the app is bypassed |
 | 3 | Updating administrator name | `updateDisplayName` → database + active session context + dashboard greeting all reflect the new name immediately; 1-char name rejected; unknown administrator reported, never created |
-| 4 | Updating administrator email with verification | Request → code emailed to the NEW address only (.eml captured, To-header checked, 8-char charset); only the HMAC hash stored; current email stays active; wrong code rejected + burns one attempt; correct code → email activated atomically, request consumed, code single-use; reuse → `not_found`; same-address re-request is idempotent; cooldown blocks immediate re-requests; expired request → `expired`; five wrong codes → `too_many_attempts`; malformed/same-address requests rejected; RLS blocks anon on `corporation_profile`, `email_change_requests` and the consume RPC |
+| 4 | Updating administrator email with verification | Request → code emailed to the NEW address only (.eml captured, To-header checked, 8-char charset); only the HMAC hash stored; current email stays active; wrong code rejected + burns one attempt; correct code → email activated atomically, request consumed, code single-use; reuse → `not_found`; same-address re-request is idempotent; cooldown blocks immediate re-requests; expired request → `expired`; five wrong codes → `too_many_attempts`; malformed/same-address requests rejected; the unprivileged `niyojan_anon` role is blocked from `corporation_profile`, `email_change_requests` and the consume function |
 | 5 | Changing corporation logo | Real PNG stored through the hardened pipeline (magic bytes, sharp re-encode, 512 px cap, UUID filename in its own `corporation-logos` area); profile updated; page renders the custom URL; served with `image/png` + `nosniff`; text-spoofed / empty / >2 MB / truncated payloads rejected; `/uploads` traversal + unrelated areas → 404; removing the logo restores the official brand asset |
 | 6 | Successful password update | `changeAdminPassword` with the correct current password → hash changed (Argon2id), `credentials_source='database'`, `password_updated_at` refreshed; new password verifies, old fails; every OTHER session revoked while the current one stays valid; bootstrap re-run never rolls the credential back |
 | 7 | Incorrect current password | → `wrong_current`; the stored hash is untouched; re-using the same password is rejected |
@@ -96,39 +96,59 @@ source) so all four suites are re-runnable in any order.
 
 ## Running the integration suites
 
-### Option A — staging Supabase project (recommended)
+### Option A — staging PostgreSQL database (recommended for pre-deploy checks)
 
-1. Create a **dedicated staging** Supabase project (never production — the suites
-   reset lockout/rate-limit state and consume OTP budget).
-2. Apply every file in `supabase/migrations/` in the SQL editor, in filename
-   order (0001, 0002, …).
+1. Create a **dedicated staging** PostgreSQL database (Neon / Lakebase / any
+   PostgreSQL 14+ — never production: the suites reset lockout/rate-limit
+   state and consume OTP budget).
+2. Apply the Drizzle migrations against it:
+   `DATABASE_URL=postgres://… bun run db:migrate`.
 3. Point `.env` at it and set `SMTP_DEV_CAPTURE=true` so codes are written to
-   `.dev-outbox/` instead of being emailed.
-4. `npx tsx scripts/test-auth.ts && npx tsx scripts/test-firms.ts && npx tsx scripts/test-account.ts`
-   (the firms + account suites also need `LOGO_STORAGE_MODE=local` when running
-   against the harness — against a real Supabase project keep `supabase`.)
+   `.dev-outbox/` instead of being emailed (dev capture is ignored whenever
+   `NODE_ENV=production`).
+4. `bun run test:auth && bun run test:firms && bun run test:account`
+   (the firms + account suites also need `LOGO_STORAGE_MODE=local` or `s3`
+   for the upload scenarios — `url` mode intentionally disables uploads.)
 
-### Option B — bundled local harness (no Supabase account)
+### Option B — bundled local harness (no external database)
 
-The harness runs **real PostgreSQL and real PostgREST** binaries locally, mirroring
-Supabase's architecture (same migration SQL, same roles — `authenticator`, `anon`,
-`authenticated`, `service_role` — same JWT-authenticated REST shape), so the app
-code and tests run unmodified:
+The harness runs **real PostgreSQL 18** binaries locally (embedded binaries,
+data in `verify-harness/pgdata/`), migrated with the same Drizzle migration
+files the application uses, so the app code and tests run unmodified against
+`DATABASE_URL` exactly as in production. It also creates the deliberately
+unprivileged `niyojan_anon` role used by the privilege-boundary checks.
 
-```bash
-node verify-harness/start.mjs     # Postgres :5433, PostgREST :5434, /rest/v1 proxy :5435
-                                  # (writes freshly minted keys into .env; also
-                                  #  auto-started with `bun run dev` in this repo)
-npx tsx scripts/test-unit.ts      # 46 checks
-npx tsx scripts/test-auth.ts      # 90 checks (Phase 1)
-npx tsx scripts/test-firms.ts     # 91 checks (Phase 2)
-npx tsx scripts/test-account.ts   # 139 checks (Phase 3)
-node verify-harness/stop.mjs      # when finished
+Prerequisite: a `.env` pointing at the harness (see `.env.example` for every
+variable — the harness does **not** write `.env` itself):
+
+```dotenv
+DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5433/niyojan
+SMTP_DEV_CAPTURE=true
+LOGO_STORAGE_MODE=local
+# + ADMIN_*, SMTP_FROM, AUTH_SESSION_SECRET, OTP_SECRET, APP_URL (see .env.example)
 ```
 
-Requirements: Linux x64, `node` ≥ 20, network access on first run (downloads the
-PostgREST static binary; PostgreSQL binaries install via npm into
-`verify-harness/node_modules`).
+```bash
+bun run harness:start          # PostgreSQL on :5433, applies drizzle/ migrations
+                               # (also auto-started with `bun run dev` via
+                               #  src/instrumentation.ts when DATABASE_URL
+                               #  points at the harness)
+bun run test:unit              # 46 checks
+bun run test:auth              # 90 checks (Phase 1) — needs `bun run dev` on :3000
+bun run test:firms             # 91 checks (Phase 2) — needs `bun run dev` on :3000
+bun run test:account           # 139 checks (Phase 3) — needs `bun run dev` on :3000
+bun run harness:stop           # when finished
+```
+
+The HTTP-level checks (unauthenticated redirects, authenticated page renders)
+drive the dev server on `http://127.0.0.1:3000`, so start it first with
+`bun run dev` (or `node scripts/dev-daemon.mjs` for a detached instance).
+
+Requirements: Linux x64, `node` ≥ 20, network access on first run (PostgreSQL
+binaries install via bun/npm into `verify-harness/node_modules`). If the host
+ICU is newer than the ICU 60 the binaries link against, place a compatible
+copy under `verify-harness/pglibs/icu60/` — see
+`verify-harness/pglibs/icu60/README.md`.
 
 ## Manual browser verification (golden path)
 
