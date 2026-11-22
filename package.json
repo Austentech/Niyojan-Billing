@@ -12,6 +12,7 @@
     "db:check": "drizzle-kit check",
     "db:studio": "drizzle-kit studio",
     "db:bootstrap": "tsx scripts/bootstrap-admin.ts",
+    "check:env": "tsx scripts/check-vercel-env.ts",
     "harness:start": "node verify-harness/start.mjs",
     "harness:stop": "node verify-harness/stop.mjs",
     "test:unit": "tsx scripts/test-unit.ts",
